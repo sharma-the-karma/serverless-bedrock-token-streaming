@@ -1,38 +1,65 @@
 """
-Production Python Streaming API with Amazon Bedrock + FastAPI + AWS Lambda Web Adapter.
+Python Streaming API with Amazon Bedrock + FastAPI + AWS Lambda Web Adapter.
 
-Why this solves the AWS re:Post dilemma:
-AWS Lambda doesn't have native streamifyResponse() for Python, but AWS Lambda Web Adapter
-(LWA) translates HTTP streaming directly into Lambda Function URL Response Streaming!
+Uses an asyncio.Queue with a background worker thread to consume the blocking
+boto3 EventStream without starving the FastAPI asyncio event loop under concurrency.
 """
 
 import os
 import json
 import asyncio
+import threading
 from typing import AsyncGenerator, Optional, List
 import boto3
-from fastapi import FastAPI, HTTPException
+from botocore.config import Config
+from fastapi import FastAPI, HTTPException, Security, Depends
+from fastapi.security.api_key import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 app = FastAPI(title="Bedrock Serverless Python Streamer")
 
+# Restrict CORS to allowed origins (configured via environment variable in production)
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
-# Initialize Bedrock client
-bedrock_runtime = boto3.client(
-    service_name="bedrock-runtime",
-    region_name=os.getenv("AWS_REGION", "us-east-1")
+# Optional API key protection for production use
+API_KEY_HEADER = APIKeyHeader(name="x-api-key", auto_error=False)
+EXPECTED_API_KEY = os.getenv("APP_API_KEY")
+
+def verify_api_key(api_key: Optional[str] = Depends(API_KEY_HEADER)):
+    if EXPECTED_API_KEY and api_key != EXPECTED_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return api_key
+
+# Configure Boto3 Bedrock Runtime Client with retries and connection reuse
+boto_config = Config(
+    retries={"max_attempts": 3, "mode": "standard"},
+    connect_timeout=10,
+    read_timeout=300,
 )
 
-DEFAULT_MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20241022-v2:0")
+bedrock_runtime = boto3.client(
+    service_name="bedrock-runtime",
+    region_name=os.getenv("AWS_REGION", "us-east-1"),
+    config=boto_config,
+)
+
+# Use current cross-region inference profiles or Foundation Model IDs
+DEFAULT_MODEL_ID = os.getenv(
+    "BEDROCK_MODEL_ID",
+    "us.anthropic.claude-3-7-sonnet-20250219-v1:0"
+)
+
+_STREAM_END = object()
 
 
 class ChatMessage(BaseModel):
@@ -42,7 +69,7 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     prompt: Optional[str] = None
-    system: Optional[str] = "You are a fast, concise AI assistant."
+    system: Optional[str] = "You are a concise, accurate AI assistant."
     modelId: Optional[str] = DEFAULT_MODEL_ID
     messages: Optional[List[ChatMessage]] = None
     temperature: Optional[float] = 0.7
@@ -51,14 +78,13 @@ class ChatRequest(BaseModel):
 
 async def stream_bedrock_events(request: ChatRequest) -> AsyncGenerator[str, None]:
     """
-    Generator yielding Server-Sent Events (SSE) formatted text chunks
-    from Bedrock converse_stream API.
+    Consumes the blocking boto3 EventStream on a background thread and yields SSE
+    events asynchronously via an asyncio.Queue, avoiding event-loop starvation.
     """
-    # Build converse messages format
     if request.messages and len(request.messages) > 0:
         messages = [m.model_dump() for m in request.messages]
     else:
-        prompt_text = request.prompt or "Hello from AWS re:Post community!"
+        prompt_text = request.prompt or "Hello from Amazon Bedrock!"
         messages = [{"role": "user", "content": [{"text": prompt_text}]}]
 
     system_content = [{"text": request.system}] if request.system else None
@@ -66,11 +92,11 @@ async def stream_bedrock_events(request: ChatRequest) -> AsyncGenerator[str, Non
     # Initial SSE event
     yield f"event: init\ndata: {json.dumps({'status': 'connected', 'modelId': request.modelId})}\n\n"
 
-    try:
-        # Run blocking boto3 Bedrock call in thread pool to preserve async loop responsiveness
-        loop = asyncio.get_event_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
 
-        def invoke():
+    def worker():
+        try:
             kwargs = {
                 "modelId": request.modelId,
                 "messages": messages,
@@ -81,15 +107,32 @@ async def stream_bedrock_events(request: ChatRequest) -> AsyncGenerator[str, Non
             }
             if system_content:
                 kwargs["system"] = system_content
-            return bedrock_runtime.converse_stream(**kwargs)
 
-        response = await loop.run_in_executor(None, invoke)
-        stream = response.get("stream")
+            response = bedrock_runtime.converse_stream(**kwargs)
+            stream = response.get("stream")
 
-        for event in stream:
-            # Yield control to event loop
-            await asyncio.sleep(0)
+            for event in stream:
+                loop.call_soon_threadsafe(queue.put_nowait, event)
 
+            loop.call_soon_threadsafe(queue.put_nowait, _STREAM_END)
+        except Exception as e:
+            loop.call_soon_threadsafe(queue.put_nowait, e)
+
+    # Start stream consumer on background thread
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+    try:
+        while True:
+            item = await queue.get()
+            if item is _STREAM_END:
+                break
+            if isinstance(item, Exception):
+                error_payload = json.dumps({"error": True, "message": str(item)})
+                yield f"event: error\ndata: {error_payload}\n\n"
+                break
+
+            event = item
             if "contentBlockDelta" in event:
                 delta = event["contentBlockDelta"]["delta"]
                 if "text" in delta:
@@ -107,9 +150,8 @@ async def stream_bedrock_events(request: ChatRequest) -> AsyncGenerator[str, Non
                 payload = json.dumps({"usage": usage, "metrics": metrics})
                 yield f"event: metadata\ndata: {payload}\n\n"
 
-    except Exception as e:
-        error_payload = json.dumps({"error": True, "message": str(e)})
-        yield f"event: error\ndata: {error_payload}\n\n"
+    finally:
+        pass
 
 
 @app.get("/health")
@@ -118,10 +160,9 @@ def health_check():
 
 
 @app.post("/stream")
-async def chat_stream(request: ChatRequest):
+async def chat_stream(request: ChatRequest, _auth: Optional[str] = Depends(verify_api_key)):
     """
-    Main endpoint for token-by-token streaming.
-    Streams Server-Sent Events directly over HTTP.
+    Streams Server-Sent Events over HTTP.
     """
     return StreamingResponse(
         stream_bedrock_events(request),
