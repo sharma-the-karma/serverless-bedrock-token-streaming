@@ -40,9 +40,9 @@ const mockEvent = {
   }),
 };
 
-console.log("=== Testing Bedrock Streaming Handler Locally ===");
-console.log("Payload:", mockEvent.body);
-console.log("--- Starting Stream ---");
+console.log("[test] Invoking Bedrock streaming handler locally");
+console.log("[test] Payload:", mockEvent.body);
+console.log("[test] Starting stream output:");
 
 try {
   await handler(mockEvent, outputStream, {});

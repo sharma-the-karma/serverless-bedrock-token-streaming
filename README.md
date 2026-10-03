@@ -41,29 +41,21 @@ sequenceDiagram
 
 ---
 
-## 📂 Repository Structure
+## Repository Layout
 
-```
-├── lambda/
-│   ├── index.mjs             # Node.js 20+ handler using native awslambda.streamifyResponse
-│   ├── local-test.mjs        # Local stream runner / simulator
-│   ├── package.json          # Node dependencies (@aws-sdk/client-bedrock-runtime)
-│   └── python_adapter/       # Python solution for re:Post users wanting Python!
-│       ├── main.py           # FastAPI + boto3 converse_stream API
-│       ├── requirements.txt  # FastAPI, uvicorn, boto3
-│       └── Dockerfile        # Container image using AWS Lambda Web Adapter
-├── infra/
-│   ├── template.yaml         # AWS SAM Template (Function URL + CloudFront)
-│   └── cdk/
-│       └── lib/
-│           └── streaming-bedrock-stack.ts # AWS CDK v2 Stack
-├── frontend/
-│   ├── index.html            # Glassmorphic streaming test playground
-│   ├── style.css             # Modern dark-mode cyber design system
-│   └── app.js                # Browser fetch ReadableStream reader + live telemetry HUD
-├── devto-blog-post.md        # Publication-ready blog post formatted for Dev.to
-└── README.md
-```
+* **`lambda/`**
+  * `index.mjs`: Production Node.js 20 streaming handler using `awslambda.streamifyResponse`
+  * `local-test.mjs`: Local simulator script to test response streams without deploying
+  * `package.json`: Bedrock runtime SDK dependencies
+  * `python_adapter/`: Alternative Python FastAPI implementation using AWS Lambda Web Adapter
+* **`infra/`**
+  * `template.yaml`: AWS SAM template configuring Lambda Function URL with `RESPONSE_STREAM`
+  * `cdk/`: AWS CDK v2 TypeScript stack implementation
+* **`frontend/`**
+  * `index.html`, `style.css`, `app.js`: Dark-mode streaming chat UI with real-time telemetry HUD
+* **`publish_to_devto.py`**: Automated Dev.to REST API publishing script
+* **`devto-blog-post.md`**: In-depth article and architectural analysis
+
 
 ---
 

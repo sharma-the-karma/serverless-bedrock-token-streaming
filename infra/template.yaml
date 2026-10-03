@@ -18,9 +18,7 @@ Globals:
         BEDROCK_MODEL_ID: "anthropic.claude-3-5-sonnet-20241022-v2:0"
 
 Resources:
-  # =========================================================================
-  # 1. Node.js Lambda Function with Native Response Streaming
-  # =========================================================================
+  # Node.js Lambda Function with Native Response Streaming
   BedrockStreamingFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -51,9 +49,7 @@ Resources:
             - Authorization
           MaxAge: 3600
 
-  # =========================================================================
-  # 2. Python Lambda Function with AWS Lambda Web Adapter (Alternative)
-  # =========================================================================
+  # Python Lambda Function with AWS Lambda Web Adapter (Alternative)
   BedrockPythonStreamingFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -83,9 +79,7 @@ Resources:
       DockerContext: ../lambda/python_adapter
       Dockerfile: Dockerfile
 
-  # =========================================================================
-  # 3. CloudFront Distribution (Bypasses Buffering with CachingDisabled)
-  # =========================================================================
+  # CloudFront Distribution (Bypasses Buffering with CachingDisabled)
   StreamingDistribution:
     Type: AWS::CloudFront::Distribution
     Properties:

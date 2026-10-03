@@ -1,17 +1,13 @@
 #!/usr/bin/env python3
 """
-Publishes devto-blog-post.md to Dev.to using the Dev.to REST API.
+Publishes or updates devto-blog-post.md to Dev.to using the Dev.to REST API.
 
 Usage:
-  python publish_to_devto.py --api-key YOUR_DEVTO_API_KEY [--draft]
-Or set environment variable:
-  $env:DEVTO_API_KEY="your_api_key"
-  python publish_to_devto.py
+  python publish_to_devto.py --api-key YOUR_DEVTO_API_KEY [--article-id ID] [--draft]
 """
 
 import os
 import sys
-import re
 import json
 import argparse
 import urllib.request
@@ -47,9 +43,9 @@ def parse_frontmatter(content: str):
                         frontmatter[key] = val
     return frontmatter, body
 
-def publish_article(api_key: str, draft: bool = False):
+def publish_or_update_article(api_key: str, article_id: str = None, draft: bool = False):
     if not os.path.exists(BLOG_FILE):
-        print(f"Error: {BLOG_FILE} not found!")
+        print(f"[error] {BLOG_FILE} not found!")
         sys.exit(1)
 
     with open(BLOG_FILE, "r", encoding="utf-8") as f:
@@ -77,9 +73,17 @@ def publish_article(api_key: str, draft: bool = False):
 
     req_data = json.dumps(payload).encode("utf-8")
 
+    if article_id:
+        url = f"https://dev.to/api/articles/{article_id}"
+        method = "PUT"
+    else:
+        url = "https://dev.to/api/articles"
+        method = "POST"
+
     req = urllib.request.Request(
-        "https://dev.to/api/articles",
+        url,
         data=req_data,
+        method=method,
         headers={
             "api-key": api_key,
             "Content-Type": "application/json",
@@ -90,14 +94,15 @@ def publish_article(api_key: str, draft: bool = False):
     try:
         with urllib.request.urlopen(req) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-            print("\n🎉 Successfully published to Dev.to!")
-            print(f"Article URL: {data.get('url')}")
+            action = "Updated" if article_id else "Published"
+            print(f"[success] {action} article on Dev.to!")
+            print(f"URL: {data.get('url')}")
             print(f"Status: {'Published' if is_published else 'Draft'}")
-            print(f"ID: {data.get('id')}")
+            print(f"Article ID: {data.get('id')}")
             return data
     except urllib.error.HTTPError as e:
         error_body = e.read().decode("utf-8")
-        print(f"\n❌ Failed to publish to Dev.to (HTTP {e.code}):")
+        print(f"[error] Failed to send article to Dev.to (HTTP {e.code}):")
         try:
             err_json = json.loads(error_body)
             print(json.dumps(err_json, indent=2))
@@ -105,12 +110,13 @@ def publish_article(api_key: str, draft: bool = False):
             print(error_body)
         sys.exit(1)
     except Exception as e:
-        print(f"\n❌ Unexpected error: {e}")
+        print(f"[error] Unexpected failure: {e}")
         sys.exit(1)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Publish markdown article to Dev.to")
+    parser = argparse.ArgumentParser(description="Publish or update markdown article to Dev.to")
     parser.add_argument("--api-key", "-k", help="Dev.to API key", default=os.getenv("DEVTO_API_KEY"))
+    parser.add_argument("--article-id", "-i", help="Existing Dev.to article ID to update", default=None)
     parser.add_argument("--draft", action="store_true", help="Publish as draft")
 
     args = parser.parse_args()
@@ -120,7 +126,7 @@ if __name__ == "__main__":
         api_key = input("Enter your Dev.to API key: ").strip()
 
     if not api_key:
-        print("Error: Dev.to API key is required. Get one at: https://dev.to/settings/extensions")
+        print("[error] Dev.to API key is required. Get one at: https://dev.to/settings/extensions")
         sys.exit(1)
 
-    publish_article(api_key, draft=args.draft)
+    publish_or_update_article(api_key, article_id=args.article_id, draft=args.draft)

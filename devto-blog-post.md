@@ -4,94 +4,77 @@ published: true
 description: "Why API Gateway breaks your streaming GenAI apps, how to fix it with Lambda Function URLs (InvokeMode: RESPONSE_STREAM), and complete working code for Node.js and Python."
 tags: aws, serverless, bedrock, ai
 cover_image: https://raw.githubusercontent.com/aws-samples/amazon-bedrock-samples/main/assets/banner.png
-canonical_url: https://dev.to/aws-builders/solving-aws-re-posts-1-genai-headache-real-time-token-streaming-with-amazon-bedrock-aws-lambda
+canonical_url: https://dev.to/sharmavarun/solving-aws-reposts-1-genai-headache-real-time-token-streaming-with-amazon-bedrock-aws-lambda-37kh
 ---
 
-If you spend even 15 minutes scrolling through [AWS re:Post](https://repost.aws/) under the `#AmazonBedrock` and `#AWSLambda` tags, you will notice a deeply familiar cry for help echoing through dozens of threads:
+If you have spent any time working with Amazon Bedrock over the past year, you have probably noticed a recurring conversation on [AWS re:Post](https://repost.aws/) under the `#AmazonBedrock` and `#AWSLambda` tags.
 
-> *"I integrated Amazon Bedrock (Claude 3.5 Sonnet) with AWS Lambda and API Gateway, but the response takes 12 seconds before the first word appears!"*
-> 
-> *"My Lambda function keeps throwing `504 Gateway Timeout` when generating long documents—how do I bypass the 29-second API Gateway timeout?"*
-> 
-> *"AWS announced Lambda Response Streaming, but where is the Python support? Do I really have to rewrite my entire LangChain / Boto3 backend in Node.js?"*
+Every couple of days, an engineer asks the exact same question:
 
-If you’ve run into any of these issues, you are not alone. Building modern Generative AI experiences demands **sub-second Time To First Token (TTFT)**. Users expect words to stream onto the screen the instant the LLM thinks, not after waiting 15 seconds for a monolithic JSON payload to finish baking.
+> *"I hooked up Bedrock (Claude 3.5 Sonnet) to a Lambda function behind API Gateway, but my chat app takes 10 to 15 seconds before the first word shows up. How do I stream tokens as they are generated?"*
 
-In this deep dive, we'll demystify why traditional serverless architectures choke on streaming, how to bypass API Gateway's 29-second ceiling, and build a production-grade token streamer with **Amazon Bedrock ConverseStream**, **Lambda Response Streaming**, and **CloudFront**—with working code for **both Node.js and Python**.
+And right behind it comes the second headache:
+
+> *"Whenever my model generates a long answer or does multi-step reasoning, API Gateway kills the request with a 504 Gateway Timeout after 29 seconds. How do I bypass this?"*
+
+I hit this exact wall on a production project. It is frustrating because Bedrock supports streaming out of the box, yet putting standard serverless glue in front of it seems to break everything.
+
+Here is what is actually going on under the hood, why API Gateway secretly buffers your responses, and how you can achieve true sub-300ms Time-To-First-Token (TTFT) using **Lambda Function URLs in Response Streaming mode**—with working code for both **Node.js** and **Python**.
 
 ---
 
-## 1. The Anatomy of the Problem: Why API Gateway Buffers Your Streams
+## 1. Why API Gateway Breaks Token Streaming
 
-When building a RESTful API on AWS, the standard architecture is usually:
+When we build web APIs on AWS, our instinct is to reach for Amazon API Gateway. The typical architecture looks like this:
 
-```
-[ Client / Browser ] 
-        ▼
-[ Amazon API Gateway ] ◄── Hard 29s timeout + Buffers entire payload!
-        ▼
-[ AWS Lambda ]
-        ▼
-[ Amazon Bedrock (Claude 3.5 Sonnet / Llama 3) ]
+```mermaid
+flowchart TD
+    Client[Web Browser] -->|HTTP Request| APIGW[Amazon API Gateway]
+    APIGW -->|Full Buffering & 29s Limit| Lambda[AWS Lambda Function]
+    Lambda -->|Converse API| Bedrock[Amazon Bedrock]
 ```
 
-This architecture works brilliantly for CRUD operations, but is fatal for LLM token streaming:
+This setup is great for traditional REST microservices, but it completely breaks for LLMs:
 
-1. **The 29-Second Hard Limit:** Amazon API Gateway (both REST and HTTP APIs) enforces an immutable 29-second integration timeout. If your model generates a detailed 2,000-token answer or runs complex reasoning, API Gateway terminates the connection with a `504 Gateway Timeout`.
-2. **Response Buffering:** API Gateway does **not** support HTTP response chunk streaming to the client. Even if your Lambda function emits chunks piece by piece, API Gateway buffers all bytes until the Lambda finishes or reaches 10MB, before sending everything at once.
-3. **Perceived Latency Explodes:** A user stares at a blank loading spinner for 8 to 15 seconds.
+1. **Full Response Buffering:** Both REST and HTTP APIs in API Gateway buffer your response in memory. Even if your Lambda emits tokens chunk-by-chunk, API Gateway holds onto every single byte until the Lambda completes execution or hits 10 MB, and only then flushes everything down to the browser. Your user stares at a spinner the whole time.
+2. **The 29-Second Hard Limit:** API Gateway enforces an immutable 29-second integration timeout. If Claude or Llama takes 32 seconds to produce a thorough 2,000-token explanation, API Gateway terminates the connection with a `504 Gateway Timeout`. You cannot raise this limit.
+3. **Terrible Perceived Latency:** Instead of words appearing instantly, users wait 8 to 15 seconds before seeing anything.
 
-### The Benchmark Comparison
+### The Numbers: Buffered vs. Streaming
 
-| Metric | API Gateway + Buffered Lambda | Lambda Function URL (`RESPONSE_STREAM`) |
+| Metric | API Gateway + Traditional Lambda | Lambda Function URL with Response Streaming |
 | :--- | :--- | :--- |
-| **Time to First Token (TTFT)** | **8,400 ms** (User waits for whole answer) | **~260 ms** (Instant feedback) |
-| **Max Response Duration** | **29 seconds** (Hard limit) | **Up to 15 minutes** (Lambda max) |
-| **Payload Ceiling** | 10 MB | 20 MB (with 6MB soft limit before streaming) |
-| **Cost** | API Gateway invocations + Lambda | **Free** Function URL layer + Lambda only |
+| **Time to First Token (TTFT)** | **8,400 ms** (User waits for entire answer) | **~260 ms** (Instant visual feedback) |
+| **Max Response Timeout** | **29 seconds** (Hard ceiling) | **Up to 15 minutes** (Full Lambda limit) |
+| **Response Buffering** | Buffered by API Gateway | None (Immediate HTTP chunked transfer) |
+| **API Layer Cost** | $1.00 to $3.50 per million calls | **$0** (Function URLs are free) |
 
 ---
 
-## 2. The Architectural Fix: Lambda Function URLs with `RESPONSE_STREAM`
+## 2. The Architectural Fix: Lambda Function URLs in `RESPONSE_STREAM` Mode
 
-In 2023, AWS introduced **Lambda Response Streaming**, allowing Lambda to progressively stream payload bytes back to clients over HTTP chunked transfer encoding.
+To stream tokens straight to the user, we bypass API Gateway and use **AWS Lambda Function URLs** configured with `InvokeMode: RESPONSE_STREAM`.
 
-By pairing **Lambda Function URLs** configured with `InvokeMode: RESPONSE_STREAM` with the Amazon Bedrock **ConverseStream API**, tokens bypass API Gateway completely:
+Lambda Function URLs provide a dedicated HTTPS endpoint for your function. When response streaming is enabled, Lambda sends data back to the client using HTTP chunked transfer encoding. Bytes leave Lambda and hit the browser immediately as they are generated by Bedrock.
 
-```
-┌──────────────────┐
-│  Client Browser  │
-│  (fetch reader)  │
-└────────┬─────────┘
-         │ Server-Sent Events (SSE) Stream
-         ▼
-┌─────────────────────────────────┐
-│   Amazon CloudFront (Optional)  │  ◄── CachePolicy: CachingDisabled
-│ (Edge CDN, Custom Domain, WAF)  │      OriginRequestPolicy: AllViewerExceptHostHeader
-└────────┬────────────────────────┘
-         │ HTTP Chunked Transfer
-         ▼
-┌─────────────────────────────────┐
-│     AWS Lambda Function URL     │  ◄── InvokeMode: RESPONSE_STREAM
-│  (awslambda.streamifyResponse)  │      Timeout: up to 15 minutes!
-└────────┬────────────────────────┘
-         │ Bidirectional EventStream
-         ▼
-┌─────────────────────────────────┐
-│  Amazon Bedrock ConverseStream  │  ◄── Anthropic Claude 3.5 Sonnet /
-│  (bedrock-runtime SDK)          │      Amazon Nova / Meta Llama 3
-└─────────────────────────────────┘
+```mermaid
+flowchart TD
+    Client[Web Browser fetch ReadableStream] -->|SSE Stream| CF[Amazon CloudFront CDN]
+    CF -->|Chunked HTTP Transfer| FURL[Lambda Function URL: RESPONSE_STREAM]
+    FURL -->|EventStream| Bedrock[Amazon Bedrock ConverseStream]
 ```
 
-Let's look at how to build this in both **Node.js** and **Python**.
+If you need a custom domain, edge caching for static assets, or AWS WAF protection, you can put CloudFront in front of the Function URL—just make sure CloudFront is configured not to buffer.
+
+Let's look at how to implement this in both Node.js and Python.
 
 ---
 
-## 3. Node.js 20+ Implementation: Pure Native Streaming
+## 3. Node.js 20+ Implementation: Native Response Streaming
 
-AWS Lambda provides native global support for response streaming in Node.js via `awslambda.streamifyResponse()` and `awslambda.HttpResponseStream`.
+Node.js has first-class native support for response streaming in AWS Lambda via the global `awslambda.streamifyResponse()` wrapper and `awslambda.HttpResponseStream`.
 
-Here is the production-ready handler using the modern Bedrock **ConverseStream API**:
+Here is the complete Lambda handler using the modern Amazon Bedrock **ConverseStream API**:
 
 ```javascript
 // lambda/index.mjs
@@ -106,21 +89,21 @@ const bedrock = new BedrockRuntimeClient({
 
 export const handler = awslambda.streamifyResponse(
   async (event, responseStream, context) => {
-    // 1. Crucial anti-buffering & SSE HTTP headers
+    // 1. Configure anti-buffering headers for Server-Sent Events (SSE)
     const httpResponseStream = awslambda.HttpResponseStream.from(responseStream, {
       statusCode: 200,
       headers: {
         "Content-Type": "text/event-stream; charset=utf-8",
         "Cache-Control": "no-cache, no-transform",
         "Connection": "keep-alive",
-        "X-Accel-Buffering": "no", // Tells reverse proxies not to buffer
+        "X-Accel-Buffering": "no", // Disables proxy buffering
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "POST, OPTIONS",
         "Access-Control-Allow-Headers": "Content-Type",
       },
     });
 
-    // Handle preflight CORS
+    // Handle browser CORS preflight
     if (event.requestContext?.http?.method === "OPTIONS") {
       httpResponseStream.end();
       return;
@@ -133,12 +116,12 @@ export const handler = awslambda.streamifyResponse(
 
     try {
       const body = event.body ? JSON.parse(event.body) : {};
-      const prompt = body.prompt || "Explain serverless streaming in 2 sentences.";
+      const prompt = body.prompt || "Explain serverless streaming in two sentences.";
       const modelId = body.modelId || "anthropic.claude-3-5-sonnet-20241022-v2:0";
 
       sendSSE({ status: "connected" }, "init");
 
-      // 2. Invoke Bedrock ConverseStream
+      // 2. Call Bedrock ConverseStream
       const command = new ConverseStreamCommand({
         modelId,
         messages: [{ role: "user", content: [{ text: prompt }] }],
@@ -147,7 +130,7 @@ export const handler = awslambda.streamifyResponse(
 
       const response = await bedrock.send(command);
 
-      // 3. Pipe Bedrock tokens directly into Lambda HttpResponseStream
+      // 3. Pipe Bedrock tokens directly into the HTTP stream
       for await (const chunk of response.stream) {
         if (chunk.contentBlockDelta?.delta?.text) {
           sendSSE({ text: chunk.contentBlockDelta.delta.text }, "delta");
@@ -160,29 +143,26 @@ export const handler = awslambda.streamifyResponse(
       console.error("Bedrock stream error:", err);
       sendSSE({ error: true, message: err.message }, "error");
     } finally {
-      // 4. Gracefully close the stream
+      // 4. Always close the stream cleanly
       httpResponseStream.end();
     }
   }
 );
 ```
 
-### Why `ConverseStream` instead of `invokeModelWithResponseStream`?
-Prior to the Converse API, each foundation model (Claude, Titan, Llama, Mistral) had completely different JSON request/response envelopes. The **ConverseStream API** standardizes:
-* Unified message syntax (`messages: [{ role: "user", content: [{ text }] }]`)
-* Cross-model tool/function calling
-* Consistent token usage telemetry
+### Why ConverseStream instead of invokeModelWithResponseStream?
+Prior to the Converse API, each foundation model on Bedrock (Claude, Titan, Llama, Mistral) had completely different JSON payload structures. The `ConverseStream` API standardizes everything: one consistent request format, unified tool calling, and consistent token telemetry across all model providers.
 
 ---
 
-## 4. The Python Dilemma: How to Stream with FastAPI & Lambda Web Adapter
+## 4. The Python Solution: FastAPI & AWS Lambda Web Adapter
 
 On AWS re:Post, Python developers frequently ask:
-> *"Why doesn't Python have `awslambda.streamifyResponse`? Must I use Node.js?"*
+> *"Why does only Node.js have `streamifyResponse`? Do I have to rewrite my Boto3 code in JavaScript?"*
 
-The answer is **NO!** You can use standard Python (`fastapi` + `boto3`) combined with the **AWS Lambda Web Adapter (LWA)**. 
+The answer is **no**. You can write standard Python using FastAPI and Boto3, and run it with the official open-source **AWS Lambda Web Adapter (LWA)**.
 
-LWA is an official AWS open-source extension that bridges standard HTTP ASGI servers (Uvicorn/FastAPI) directly to Lambda Function URL response streaming!
+LWA is a tiny extension from AWS that bridges standard HTTP ASGI servers (FastAPI/Uvicorn) directly to Lambda Function URL response streaming.
 
 ### `main.py`
 ```python
@@ -205,7 +185,7 @@ class ChatRequest(BaseModel):
 async def generate_bedrock_stream(prompt: str, model_id: str) -> AsyncGenerator[str, None]:
     loop = asyncio.get_event_loop()
     
-    # Run blocking Boto3 call in executor
+    # Run synchronous Boto3 call in thread executor
     response = await loop.run_in_executor(
         None,
         lambda: bedrock.converse_stream(
@@ -215,7 +195,7 @@ async def generate_bedrock_stream(prompt: str, model_id: str) -> AsyncGenerator[
     )
 
     for event in response.get("stream"):
-        await asyncio.sleep(0) # yield control to event loop
+        await asyncio.sleep(0) # Yield control to the event loop
         if "contentBlockDelta" in event:
             text = event["contentBlockDelta"]["delta"]["text"]
             yield f"event: delta\ndata: {json.dumps({'text': text})}\n\n"
@@ -242,7 +222,7 @@ FROM public.ecr.aws/docker/library/python:3.11-slim
 # Copy the adapter binary
 COPY --from=aws-lwa /lambda-adapter /opt/extensions/lambda-adapter
 
-# Crucial environment variable that enables streaming
+# Configure streaming mode
 ENV PORT=8080
 ENV AWS_LWA_INVOKE_MODE=response_stream
 
@@ -256,12 +236,12 @@ CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
 
 ---
 
-## 5. Infrastructure as Code: The Magic Configuration
+## 5. Infrastructure as Code: The Critical Setting
 
-The secret sauce is setting `InvokeMode: RESPONSE_STREAM` on the Lambda Function URL. 
+The magic switch in your SAM template or CloudFormation is setting `InvokeMode: RESPONSE_STREAM` on the Function URL config:
 
-### AWS SAM (`template.yaml`)
 ```yaml
+# infra/template.yaml
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 
@@ -272,7 +252,7 @@ Resources:
       CodeUri: ../lambda/
       Handler: index.handler
       Runtime: nodejs20.x
-      Timeout: 300 # 5-minute timeout! Bypasses API Gateway 29s
+      Timeout: 300 # 5-minute timeout, well beyond API Gateway's 29s
       MemorySize: 512
       Policies:
         - Statement:
@@ -283,25 +263,23 @@ Resources:
               Resource: "*"
       FunctionUrlConfig:
         AuthType: NONE
-        InvokeMode: RESPONSE_STREAM #  THE CRITICAL FLAG
+        InvokeMode: RESPONSE_STREAM # Enables chunked streaming
         Cors:
           AllowOrigins: ["*"]
           AllowMethods: ["GET", "POST", "OPTIONS"]
           AllowHeaders: ["Content-Type", "Authorization"]
 ```
 
-### Adding CloudFront Without Breaking Streaming
-If you want to attach a custom domain or AWS WAF, place Amazon CloudFront in front of the Lambda Function URL. **Watch out for response buffering!**
-
-To ensure CloudFront streams chunks instantly:
-1. Set `CachePolicyId: 4135ea2d-6df8-44a3-9df3-44ca84e08fad` (AWS Managed **CachingDisabled**).
-2. Set `OriginRequestPolicyId: b6847045-a537-4142-8132-7d0dc659e210` (**AllViewerExceptHostHeader**).
+### Don't Let CloudFront Buffer Your Stream
+If you route CloudFront to your Lambda Function URL, CloudFront might buffer responses if your cache policies are not set correctly:
+1. Attach `CachePolicyId: 4135ea2d-6df8-44a3-9df3-44ca84e08fad` (AWS Managed **CachingDisabled**).
+2. Attach `OriginRequestPolicyId: b6847045-a537-4142-8132-7d0dc659e210` (**AllViewerExceptHostHeader**).
 
 ---
 
-## 6. Frontend: Consuming SSE with Browser `ReadableStream`
+## 6. How to Read the Stream in the Browser
 
-Instead of old-school `EventSource` (which only supports `GET` requests and makes sending large conversational histories difficult), consume the stream using modern `fetch()` and `ReadableStreamDefaultReader`:
+Forget old-school `EventSource` (which only supports GET requests and makes sending chat histories awkward). You can consume the stream cleanly with modern `fetch()` and `ReadableStreamDefaultReader`:
 
 ```javascript
 async function streamChat(prompt, onToken) {
@@ -321,17 +299,17 @@ async function streamChat(prompt, onToken) {
 
     buffer += decoder.decode(value, { stream: true });
     const lines = buffer.split("\n");
-    buffer = lines.pop(); // Retain incomplete line
+    buffer = lines.pop(); // Keep partial line
 
     for (const line of lines) {
       if (line.startsWith("data:")) {
         try {
           const payload = JSON.parse(line.replace("data:", "").trim());
           if (payload.text) {
-            onToken(payload.text); // Render word to UI in real time!
+            onToken(payload.text); // Render token to UI immediately
           }
-        } catch (e) {
-          // ignore keep-alives or partial JSON
+        } catch {
+          // Ignore heartbeats or partial JSON
         }
       }
     }
@@ -341,23 +319,23 @@ async function streamChat(prompt, onToken) {
 
 ---
 
-## 7. Top 4 Pitfalls Discussed on AWS re:Post
+## 7. Real-World Gotchas from Production
 
-Here are the hard-won gotchas straight from community troubleshooting:
+Here are four common pitfalls frequently discussed on re:Post that will save you hours of debugging:
 
-1. **`Transfer-Encoding: chunked` vs `Content-Length`:** Never set a `Content-Length` header in a streaming response. Doing so causes proxies and browsers to wait until all bytes match the length before rendering.
-2. **CORS Preflight (OPTIONS):** When browsers initiate a streaming `fetch` with custom headers, they send an `OPTIONS` preflight request. If your Lambda doesn't handle `OPTIONS` immediately with HTTP 204/200, the browser blocks the connection.
-3. **Session Concurrency Leaks:** On Bedrock Agents, concurrent requests hitting the same `runtimeSessionId` can occasionally leak internal trace chunks into your stream. Filter explicitly for `contentBlockDelta` chunks.
-4. **Bandwidth Costs:** Lambda Function URLs charge standard Lambda invocation time and duration plus AWS Data Transfer Out. However, because you eliminate API Gateway's $1.00/million HTTP API or $3.50/million REST API fees, Function URLs are significantly cheaper for GenAI workloads.
+1. **Never set a Content-Length header:** If you or an intermediary proxy attach a `Content-Length` header, browsers and proxies will wait until all bytes have arrived before displaying anything.
+2. **Handle CORS OPTIONS preflights explicitly:** Browsers send an HTTP `OPTIONS` request before initiating a streaming POST request. Your streaming handler must intercept OPTIONS and return HTTP 204 or 200 immediately.
+3. **Filter Bedrock Agent events:** If you are streaming through Amazon Bedrock Agents rather than direct models, concurrent requests sharing a session ID can occasionally emit trace metadata. Make sure you only render chunks matching `contentBlockDelta`.
+4. **Substantial Cost Savings:** Lambda Function URLs charge standard Lambda invocation time and duration plus AWS Data Transfer Out. By eliminating API Gateway, you avoid API Gateway's $1.00 to $3.50 per million request fees on your LLM traffic.
 
 ---
 
 ## Conclusion & Code Repository
 
-Token streaming isn't just an aesthetic feature—it is the difference between an application feeling responsive and one feeling completely unresponsive. By moving from API Gateway to **Lambda Function URLs with `InvokeMode: RESPONSE_STREAM`**, you cut your TTFT by **over 95%** and eliminate the 29-second execution wall.
+Token streaming transforms a sluggish GenAI experience into something that feels instant and responsive. Moving from API Gateway to **Lambda Function URLs in Response Streaming mode** drops your TTFT from over 8 seconds down to ~260ms and removes the 29-second execution cliff entirely.
 
-The complete code, SAM templates, CDK stack, and an interactive glassmorphic web test playground are available in the repository:
+All code, SAM templates, CDK definitions, and an interactive dark-mode test playground are open-source and ready to deploy:
 
 🔗 **GitHub Repository:** [sharma-the-karma/serverless-bedrock-token-streaming](https://github.com/sharma-the-karma/serverless-bedrock-token-streaming)
 
-Happy streaming! What foundation model are you deploying on AWS Bedrock? Let's discuss in the comments below!
+Give it a try in your AWS account and let me know in the comments how your team is handling streaming GenAI workloads!
