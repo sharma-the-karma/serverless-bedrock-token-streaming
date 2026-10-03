@@ -19,7 +19,9 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-BLOG_FILE = os.path.join(os.path.dirname(__file__), "devto-blog-post.md")
+DEFAULT_BLOG_FILE = os.path.join(
+    os.path.dirname(__file__), "blog", "serverless-bedrock-token-streaming.md"
+)
 
 def parse_frontmatter(content: str):
     frontmatter = {}
@@ -43,12 +45,12 @@ def parse_frontmatter(content: str):
                         frontmatter[key] = val
     return frontmatter, body
 
-def publish_or_update_article(api_key: str, article_id: str = None, draft: bool = False):
-    if not os.path.exists(BLOG_FILE):
-        print(f"[error] {BLOG_FILE} not found!")
+def publish_or_update_article(api_key: str, file_path: str = DEFAULT_BLOG_FILE, article_id: str = None, draft: bool = False):
+    if not os.path.exists(file_path):
+        print(f"[error] {file_path} not found!")
         sys.exit(1)
 
-    with open(BLOG_FILE, "r", encoding="utf-8") as f:
+    with open(file_path, "r", encoding="utf-8") as f:
         content = f.read()
 
     fm, body = parse_frontmatter(content)
@@ -116,6 +118,7 @@ def publish_or_update_article(api_key: str, article_id: str = None, draft: bool 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Publish or update markdown article to Dev.to")
     parser.add_argument("--api-key", "-k", help="Dev.to API key", default=os.getenv("DEVTO_API_KEY"))
+    parser.add_argument("--file", "-f", help="Markdown article file path", default=DEFAULT_BLOG_FILE)
     parser.add_argument("--article-id", "-i", help="Existing Dev.to article ID to update", default=None)
     parser.add_argument("--draft", action="store_true", help="Publish as draft")
 
@@ -129,4 +132,4 @@ if __name__ == "__main__":
         print("[error] Dev.to API key is required. Get one at: https://dev.to/settings/extensions")
         sys.exit(1)
 
-    publish_or_update_article(api_key, article_id=args.article_id, draft=args.draft)
+    publish_or_update_article(api_key, file_path=args.file, article_id=args.article_id, draft=args.draft)

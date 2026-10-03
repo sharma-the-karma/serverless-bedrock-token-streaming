@@ -2,7 +2,7 @@
 
 [![AWS Lambda](https://img.shields.io/badge/AWS-Lambda%20Response%20Streaming-orange?logo=amazon-aws)](https://docs.aws.amazon.com/lambda/latest/dg/configuration-response-streaming.html)
 [![Amazon Bedrock](https://img.shields.io/badge/Amazon-Bedrock%20ConverseStream-blueviolet?logo=amazon-aws)](https://aws.amazon.com/bedrock/)
-[![Dev.to Blog Post](https://img.shields.io/badge/Dev.to-Article-black?logo=dev-to)](./devto-blog-post.md)
+[![Dev.to Blog Post](https://img.shields.io/badge/Dev.to-Article-black?logo=dev-to)](./blog/serverless-bedrock-token-streaming.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 
 > **Solving the #1 GenAI headache trending on [AWS re:Post](https://repost.aws/):** How to stream tokens from Amazon Bedrock in real time to web clients without hitting API Gateway's 29-second timeout or response buffering.
@@ -53,8 +53,9 @@ sequenceDiagram
   * `cdk/`: AWS CDK v2 TypeScript stack implementation
 * **`frontend/`**
   * `index.html`, `style.css`, `app.js`: Dark-mode streaming chat UI with real-time telemetry HUD
+* **`blog/`**
+  * `serverless-bedrock-token-streaming.md`: In-depth article and architectural analysis
 * **`publish_to_devto.py`**: Automated Dev.to REST API publishing script
-* **`devto-blog-post.md`**: In-depth article and architectural analysis
 
 
 ---
@@ -122,7 +123,7 @@ Endpoint available at `http://localhost:8080/stream`.
 ## 📝 Published Blog Post
 
 The full in-depth article explaining the architectural decisions, CloudFront cache policies, and common gotchas is available in:
-👉 [`devto-blog-post.md`](./devto-blog-post.md)
+👉 [`blog/serverless-bedrock-token-streaming.md`](./blog/serverless-bedrock-token-streaming.md)
 
 ---
 
