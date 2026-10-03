@@ -36,7 +36,7 @@ outputStream.on("finish", () => {
 const mockEvent = {
   body: JSON.stringify({
     prompt: "Write a haiku about serverless response streaming.",
-    modelId: "anthropic.claude-3-haiku-20240307-v1:0",
+    modelId: "amazon.nova-pro-v1:0",
   }),
 };
 

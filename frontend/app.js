@@ -238,8 +238,10 @@ chatForm.addEventListener("submit", async (e) => {
               metricTokens.textContent = tokenCount.toString();
               metricDuration.textContent = `${elapsedSec.toFixed(1)} s`;
               metricSpeed.textContent = `${Math.round(tokenCount / Math.max(elapsedSec, 0.1))} tps`;
-            } else if (currentEvent === "metric_ttft" && data.ttftMs) {
-              metricTtft.textContent = `${data.ttftMs} ms`;
+            } else if (currentEvent === "done") {
+              if (data.usage?.totalTokens) {
+                metricTokens.textContent = data.usage.totalTokens.toString();
+              }
             } else if (currentEvent === "error") {
               assistantBubble.innerHTML += `<br/><strong style="color:var(--accent-red)">Error: ${data.message}</strong>`;
             }
@@ -268,27 +270,27 @@ async function simulateStreaming(prompt, bubble, cursor, { startTime, onToken })
   const simulatedAnswers = {
     default: [
       "Token-by-token streaming ",
-      "transforms the user experience ",
-      "by cutting perceived latency ",
-      "from **8.5 seconds** down to **sub-300ms** Time To First Token (TTFT).\n\n",
-      "### Why API Gateway Breaks Streaming:\n",
-      "1. **29-Second Hard Limit:** API Gateway abruptly cuts off long generations.\n",
-      "2. **Response Buffering:** Both REST and HTTP APIs accumulate all chunks before forwarding.\n\n",
-      "### The Architectural Fix:\n",
-      "Deploy an **AWS Lambda Function URL** with `InvokeMode: RESPONSE_STREAM`.\n",
-      "Combine it with `@aws-sdk/client-bedrock-runtime`'s `ConverseStreamCommand`.\n\n",
+      "delivers immediate feedback ",
+      "by rendering model tokens as they arrive ",
+      "over an HTTP chunked connection.\n\n",
+      "### Architecture Pattern:\n",
+      "1. **Lambda Function URLs (`RESPONSE_STREAM`):** Direct HTTP streaming endpoint using Node.js `awslambda.streamifyResponse` or Python ASGI via AWS Lambda Web Adapter.\n",
+      "2. **Bedrock `ConverseStream`:** Streams token chunks (`contentBlockDelta`) and metadata as an EventStream.\n",
+      "3. **CloudFront CDN:** Caching disabled (`4135ea2d-6df8-44a3-9df3-44ca84e08fad`) with origin verification (`X-Origin-Verify`).\n\n",
       "```javascript\n",
       "export const handler = awslambda.streamifyResponse(\n",
       "  async (event, responseStream, context) => {\n",
       "    const stream = awslambda.HttpResponseStream.from(responseStream, headers);\n",
       "    for await (const chunk of bedrockResponse.stream) {\n",
-      "      stream.write(`data: ${JSON.stringify(chunk)}\\n\\n`);\n",
+      "      if (chunk.contentBlockDelta?.delta?.text) {\n",
+      "        stream.write(`event: delta\\ndata: ${JSON.stringify({ text: chunk.contentBlockDelta.delta.text })}\\n\\n`);\n",
+      "      }\n",
       "    }\n",
       "    stream.end();\n",
       "  }\n",
       ");\n",
       "```\n\n",
-      "The browser streams tokens immediately via standard `ReadableStream`!",
+      "The client browser processes incoming SSE chunks through the Fetch `ReadableStream` API in real time.",
     ],
   };
 

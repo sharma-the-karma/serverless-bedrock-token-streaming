@@ -37,11 +37,12 @@ sequenceDiagram
 
 Exposing a Lambda Function URL that calls Amazon Bedrock requires explicit safeguards to prevent unauthorized inference charges:
 
-* **Origin Verification:** Because CloudFront Origin Access Control (OAC) with Lambda Function URLs has limitations signing HTTP `POST` payloads, this template secures the Function URL origin using CloudFront custom headers (`X-Origin-Verify`). The Lambda handler rejects any direct requests that lack this secret header.
+* **Origin Verification:** CloudFront Origin Access Control (OAC) with Lambda Function URLs has limitations signing browser-originated HTTP `POST` payloads with SigV4. This architecture configures the Function URL with `AuthType: NONE` and locks down access by routing through CloudFront with a custom header (`X-Origin-Verify`). Handlers enforce constant-time string comparison (`crypto.timingSafeEqual` in Node.js, `secrets.compare_digest` in Python) to prevent timing side-channel attacks.
 * **Model Allowlist:** Both Node.js and Python handlers enforce a server-side allowlist (`ALLOWED_MODELS`). Callers cannot invoke unapproved or expensive models by tampering with the request body.
-* **Input Validation & Size Caps:** Prompts are capped at 4,000 characters and request bodies at 50 KB to block oversized payload abuse before calling Bedrock.
-* **IAM Scoping:** Execution policies are pinned to specific foundation models (`amazon.nova-pro-v1:0`, `amazon.nova-lite-v1:0`, `anthropic.claude-3-5-haiku-20241022-v1:0`, `anthropic.claude-3-7-sonnet-20250219-v1:0`) and regional inference profile ARNs.
-* **CORS:** The `CorsOrigin` parameter restricts allowed origins to your domain.
+* **Input Validation & Size Caps:** Total input characters across `prompt` or `messages` arrays are capped at 4,000 characters, `system` prompts are capped at 1,000 characters, and raw request bodies are limited to 50 KB to block payload abuse before calling Bedrock.
+* **Client Disconnect Handling:** In the Python implementation, client disconnects trigger a cancellation event (`threading.Event`) that immediately halts the worker thread draining the Bedrock stream, avoiding charges for unread tokens.
+* **IAM Scoping:** Execution policies are pinned to specific foundation models (`amazon.nova-pro-v1:0`, `amazon.nova-lite-v1:0`, `anthropic.claude-3-5-haiku-20241022-v1:0`, `anthropic.claude-3-7-sonnet-20250219-v1:0`) and regional inference profile ARNs, with no foundation model wildcards.
+* **CORS:** The `CorsOrigin` parameter restricts allowed origins to your domain, and allowed methods are restricted to `POST, OPTIONS`.
 
 ---
 

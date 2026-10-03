@@ -24,12 +24,10 @@ Globals:
   Function:
     Timeout: 300
     MemorySize: 512
-    Runtime: nodejs22.x
     Architectures:
       - arm64
     Environment:
       Variables:
-        NODE_OPTIONS: "--enable-source-maps"
         BEDROCK_MODEL_ID: "amazon.nova-pro-v1:0"
         ALLOWED_ORIGIN: !Ref CorsOrigin
         ORIGIN_VERIFY_SECRET: !Ref OriginVerifySecret
@@ -41,7 +39,11 @@ Resources:
     Properties:
       CodeUri: ../lambda/
       Handler: index.handler
+      Runtime: nodejs22.x
       Description: "Streams Amazon Bedrock tokens in real-time via Server-Sent Events (SSE)"
+      Environment:
+        Variables:
+          NODE_OPTIONS: "--enable-source-maps"
       Policies:
         - Statement:
             - Sid: BedrockPinnedModelInvokePolicy
@@ -55,6 +57,8 @@ Resources:
                 - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-5-haiku-20241022-v1:0"
                 - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-7-sonnet-20250219-v1:0"
                 - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*"
+                - !Sub "arn:${AWS::Partition}:bedrock:*:*:inference-profile/us.anthropic.claude-3-7-sonnet-20250219-v1:0"
+                - !Sub "arn:${AWS::Partition}:bedrock:*:*:inference-profile/us.anthropic.claude-3-5-haiku-20241022-v1:0"
       FunctionUrlConfig:
         AuthType: NONE # Secured via CloudFront X-Origin-Verify shared secret header validation
         InvokeMode: RESPONSE_STREAM
@@ -62,7 +66,6 @@ Resources:
           AllowOrigins:
             - !Ref CorsOrigin
           AllowMethods:
-            - GET
             - POST
             - OPTIONS
           AllowHeaders:
@@ -91,6 +94,8 @@ Resources:
                 - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-5-haiku-20241022-v1:0"
                 - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-7-sonnet-20250219-v1:0"
                 - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*"
+                - !Sub "arn:${AWS::Partition}:bedrock:*:*:inference-profile/us.anthropic.claude-3-7-sonnet-20250219-v1:0"
+                - !Sub "arn:${AWS::Partition}:bedrock:*:*:inference-profile/us.anthropic.claude-3-5-haiku-20241022-v1:0"
       FunctionUrlConfig:
         AuthType: NONE
         InvokeMode: RESPONSE_STREAM
@@ -98,11 +103,14 @@ Resources:
           AllowOrigins:
             - !Ref CorsOrigin
           AllowMethods:
-            - GET
             - POST
             - OPTIONS
           AllowHeaders:
-            - "*"
+            - Content-Type
+            - Authorization
+            - x-api-key
+            - x-origin-verify
+          MaxAge: 3600
     Metadata:
       DockerTag: latest
       DockerContext: ../lambda/python_adapter

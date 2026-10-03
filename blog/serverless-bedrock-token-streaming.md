@@ -4,7 +4,7 @@ published: true
 description: "A technical guide to streaming Bedrock tokens using Lambda Function URLs in RESPONSE_STREAM mode, addressing API Gateway tradeoffs, Python asyncio concurrency, and production security."
 tags: aws, serverless, bedrock, architecture
 cover_image: https://raw.githubusercontent.com/sharma-the-karma/serverless-bedrock-token-streaming/main/assets/cover.png
-canonical_url: https://dev.to/sharmavarun/solving-aws-reposts-1-genai-headache-real-time-token-streaming-with-amazon-bedrock-aws-lambda-37kh
+canonical_url: https://github.com/sharma-the-karma/serverless-bedrock-token-streaming
 ---
 
 When building interactive generative AI applications on AWS, managing Time-To-First-Token (TTFT) is critical. While Amazon Bedrock natively supports streaming token responses via its `ConverseStream` API, exposing this stream to client browsers over serverless infrastructure requires choosing the right architectural path.
@@ -51,6 +51,7 @@ AWS Lambda supports native response streaming in Node.js via `awslambda.streamif
 
 ```javascript
 // lambda/index.mjs
+import crypto from "node:crypto";
 import {
   BedrockRuntimeClient,
   ConverseStreamCommand,
@@ -71,9 +72,19 @@ const ALLOWED_MODELS = new Set([
 const DEFAULT_MODEL_ID = process.env.BEDROCK_MODEL_ID || "amazon.nova-pro-v1:0";
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "https://yourdomain.com";
 const EXPECTED_ORIGIN_VERIFY = process.env.ORIGIN_VERIFY_SECRET;
+const EXPECTED_API_KEY = process.env.APP_API_KEY;
 
-const MAX_PROMPT_CHARS = 4000;
+const MAX_TOTAL_PROMPT_CHARS = 4000;
+const MAX_SYSTEM_CHARS = 1000;
 const MAX_BODY_BYTES = 50 * 1024; // 50 KB
+
+function safeCompare(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
 
 export const handler = awslambda.streamifyResponse(
   async (event, responseStream, context) => {
@@ -84,7 +95,7 @@ export const handler = awslambda.streamifyResponse(
       "X-Accel-Buffering": "no",
       "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
       "Access-Control-Allow-Methods": "POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization, x-origin-verify",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, x-api-key, x-origin-verify",
     };
 
     if (event.requestContext?.http?.method === "OPTIONS") {
@@ -99,13 +110,27 @@ export const handler = awslambda.streamifyResponse(
     // Origin verification guard: Ensures requests route through CloudFront
     if (EXPECTED_ORIGIN_VERIFY) {
       const originHeader = event.headers?.["x-origin-verify"] || event.headers?.["X-Origin-Verify"];
-      if (originHeader !== EXPECTED_ORIGIN_VERIFY) {
+      if (!safeCompare(originHeader, EXPECTED_ORIGIN_VERIFY)) {
         const forbiddenResponse = awslambda.HttpResponseStream.from(responseStream, {
           statusCode: 403,
           headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": ALLOWED_ORIGIN },
         });
         forbiddenResponse.write(JSON.stringify({ error: "Forbidden: Direct Function URL access is blocked." }));
         forbiddenResponse.end();
+        return;
+      }
+    }
+
+    // Optional application-layer API key validation
+    if (EXPECTED_API_KEY) {
+      const requestApiKey = event.headers?.["x-api-key"] || event.headers?.["X-Api-Key"];
+      if (!safeCompare(requestApiKey, EXPECTED_API_KEY)) {
+        const unauthorizedResponse = awslambda.HttpResponseStream.from(responseStream, {
+          statusCode: 401,
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": ALLOWED_ORIGIN },
+        });
+        unauthorizedResponse.write(JSON.stringify({ error: "Unauthorized: Invalid x-api-key." }));
+        unauthorizedResponse.end();
         return;
       }
     }
@@ -135,10 +160,31 @@ export const handler = awslambda.streamifyResponse(
     try {
       const body = event.body ? JSON.parse(event.body) : {};
       const prompt = String(body.prompt || "Explain distributed consensus in two sentences.");
+      const systemPrompt = String(body.system || "");
+      const conversationHistory = Array.isArray(body.messages) ? body.messages : [];
       const modelId = String(body.modelId || DEFAULT_MODEL_ID);
 
-      if (prompt.length > MAX_PROMPT_CHARS) {
-        sendSSE({ error: true, message: `Prompt exceeds ${MAX_PROMPT_CHARS} character limit.` }, "error");
+      if (systemPrompt.length > MAX_SYSTEM_CHARS) {
+        sendSSE({ error: true, message: `System prompt exceeds maximum allowed length of ${MAX_SYSTEM_CHARS} characters.` }, "error");
+        stream.end();
+        return;
+      }
+
+      let totalInputChars = 0;
+      if (conversationHistory.length > 0) {
+        for (const msg of conversationHistory) {
+          if (Array.isArray(msg.content)) {
+            for (const part of msg.content) {
+              if (part.text) totalInputChars += String(part.text).length;
+            }
+          }
+        }
+      } else {
+        totalInputChars = prompt.length;
+      }
+
+      if (totalInputChars > MAX_TOTAL_PROMPT_CHARS) {
+        sendSSE({ error: true, message: `Total input text (${totalInputChars} chars) exceeds maximum allowed length of ${MAX_TOTAL_PROMPT_CHARS} characters.` }, "error");
         stream.end();
         return;
       }
@@ -151,22 +197,35 @@ export const handler = awslambda.streamifyResponse(
 
       sendSSE({ status: "connected", modelId }, "init");
 
+      const messages = conversationHistory.length > 0
+        ? conversationHistory
+        : [{ role: "user", content: [{ text: prompt }] }];
+
       const command = new ConverseStreamCommand({
         modelId,
-        messages: [{ role: "user", content: [{ text: prompt }] }],
+        messages,
+        system: systemPrompt ? [{ text: systemPrompt }] : undefined,
         inferenceConfig: { maxTokens: 2048, temperature: 0.7 },
       });
 
-      const response = await bedrock.send(command);
+      const bedrockResponse = await bedrock.send(command);
 
-      for await (const chunk of response.stream) {
+      let stopReason = null;
+      let tokenUsage = null;
+
+      for await (const chunk of bedrockResponse.stream) {
         if (chunk.contentBlockDelta?.delta?.text) {
           sendSSE({ text: chunk.contentBlockDelta.delta.text }, "delta");
         }
         if (chunk.messageStop) {
-          sendSSE({ stopReason: chunk.messageStop.stopReason }, "done");
+          stopReason = chunk.messageStop.stopReason;
+        }
+        if (chunk.metadata?.usage) {
+          tokenUsage = chunk.metadata.usage;
         }
       }
+
+      sendSSE({ stopReason, usage: tokenUsage }, "done");
     } catch (err) {
       console.error("Bedrock stream error:", err);
       sendSSE({ error: true, message: err.message }, "error");
@@ -202,10 +261,11 @@ Offload the synchronous stream iteration to a background worker thread, pushing 
 import os
 import json
 import asyncio
+import secrets
 import threading
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
 import boto3
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -220,52 +280,90 @@ ALLOWED_MODELS = {
     "us.anthropic.claude-3-5-haiku-20241022-v1:0",
 }
 
-class ChatRequest(BaseModel):
-    prompt: str = Field(..., max_length=4000)
-    modelId: str = Field("amazon.nova-pro-v1:0")
+EXPECTED_ORIGIN_VERIFY = os.getenv("ORIGIN_VERIFY_SECRET")
 
-async def stream_bedrock_events(request: ChatRequest) -> AsyncGenerator[str, None]:
+def safe_compare(val: Optional[str], expected: Optional[str]) -> bool:
+    if not val or not expected:
+        return False
+    return secrets.compare_digest(val.strip(), expected.strip())
+
+class ChatRequest(BaseModel):
+    prompt: Optional[str] = Field(None, max_length=4000)
+    system: Optional[str] = Field("You are a concise, accurate AI assistant.", max_length=1000)
+    modelId: Optional[str] = Field("amazon.nova-pro-v1:0")
+
+async def stream_bedrock_events(request: ChatRequest, http_req: Request) -> AsyncGenerator[str, None]:
     if request.modelId not in ALLOWED_MODELS:
         yield f"event: error\ndata: {json.dumps({'error': f'Model {request.modelId} not allowed.'})}\n\n"
         return
 
     queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
+    stop_event = threading.Event()
 
     def worker():
         try:
             response = bedrock.converse_stream(
                 modelId=request.modelId,
-                messages=[{"role": "user", "content": [{"text": request.prompt}]}],
+                messages=[{"role": "user", "content": [{"text": request.prompt or "Hello"}]}],
             )
             for event in response.get("stream"):
+                if stop_event.is_set():
+                    break
                 loop.call_soon_threadsafe(queue.put_nowait, event)
             loop.call_soon_threadsafe(queue.put_nowait, _STREAM_END)
         except Exception as e:
             loop.call_soon_threadsafe(queue.put_nowait, e)
 
-    threading.Thread(target=worker, daemon=True).start()
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
 
-    yield f"event: init\ndata: {json.dumps({'status': 'connected'})}\n\n"
+    yield f"event: init\ndata: {json.dumps({'status': 'connected', 'modelId': request.modelId})}\n\n"
 
-    while True:
-        item = await queue.get()
-        if item is _STREAM_END:
-            break
-        if isinstance(item, Exception):
-            yield f"event: error\ndata: {json.dumps({'error': str(item)})}\n\n"
-            break
+    stop_reason = None
+    token_usage = None
 
-        if "contentBlockDelta" in item:
-            text = item["contentBlockDelta"]["delta"]["text"]
-            yield f"event: delta\ndata: {json.dumps({'text': text})}\n\n"
-        elif "messageStop" in item:
-            yield f"event: done\ndata: {json.dumps({'status': 'complete'})}\n\n"
+    try:
+        while True:
+            if await http_req.is_disconnected():
+                stop_event.set()
+                break
+
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+
+            if item is _STREAM_END:
+                break
+            if isinstance(item, Exception):
+                yield f"event: error\ndata: {json.dumps({'error': str(item)})}\n\n"
+                break
+
+            if "contentBlockDelta" in item:
+                text = item["contentBlockDelta"]["delta"]["text"]
+                yield f"event: delta\ndata: {json.dumps({'text': text})}\n\n"
+            elif "messageStop" in item:
+                stop_reason = item["messageStop"].get("stopReason")
+            elif "metadata" in item:
+                token_usage = item["metadata"].get("usage")
+
+        if not stop_event.is_set():
+            yield f"event: done\ndata: {json.dumps({'stopReason': stop_reason, 'usage': token_usage})}\n\n"
+    finally:
+        stop_event.set()
 
 @app.post("/stream")
-async def chat_endpoint(req: ChatRequest):
+async def chat_endpoint(
+    req: ChatRequest,
+    http_req: Request,
+    x_origin_verify: Optional[str] = Header(None, alias="x-origin-verify"),
+):
+    if EXPECTED_ORIGIN_VERIFY and not safe_compare(x_origin_verify, EXPECTED_ORIGIN_VERIFY):
+        raise HTTPException(status_code=403, detail="Forbidden: Direct Function URL access blocked.")
+
     return StreamingResponse(
-        stream_bedrock_events(req),
+        stream_bedrock_events(req, http_req),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -294,6 +392,8 @@ Exposing a Lambda Function URL that calls Amazon Bedrock requires explicit acces
        - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-5-haiku-20241022-v1:0"
        - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-7-sonnet-20250219-v1:0"
        - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*"
+       - !Sub "arn:${AWS::Partition}:bedrock:*:*:inference-profile/us.anthropic.claude-3-7-sonnet-20250219-v1:0"
+       - !Sub "arn:${AWS::Partition}:bedrock:*:*:inference-profile/us.anthropic.claude-3-5-haiku-20241022-v1:0"
    ```
 3. **Restrict CORS:** Explicitly whitelist your domain in `AllowOrigins`. Wildcard CORS (`*`) allows unauthorized web origins to make cross-site calls to your endpoint.
 4. **Deploy CloudFront with AWS WAF:** Place AWS WAF in front of CloudFront to enforce rate limits, geo-restrictions, and bot control.

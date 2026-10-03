@@ -22,3 +22,7 @@ Thumbs.db
 create_cover_image.py
 generate_demo_gif.py
 publish_to_devto.py
+
+# Archives
+*.zip
+

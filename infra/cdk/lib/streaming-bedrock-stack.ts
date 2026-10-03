@@ -6,11 +6,17 @@ import * as cloudfront from "aws-cdk-lib/aws-cloudfront";
 import * as origins from "aws-cdk-lib/aws-cloudfront-origins";
 import * as path from "node:path";
 
+export interface StreamingBedrockStackProps extends cdk.StackProps {
+  corsOrigin?: string;
+  originVerifySecret?: string;
+}
+
 export class StreamingBedrockStack extends cdk.Stack {
-  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+  constructor(scope: Construct, id: string, props?: StreamingBedrockStackProps) {
     super(scope, id, props);
 
-    const originVerifySecret = "ChangeMeInProductionSecretToken123!";
+    const corsOrigin = props?.corsOrigin || "https://yourdomain.com";
+    const originVerifySecret = props?.originVerifySecret || "ChangeMeInProductionSecretToken123!";
 
     // 1. Define Lambda Function with Node.js 22.x
     const streamingFn = new lambda.Function(this, "BedrockStreamingFunction", {
@@ -22,7 +28,7 @@ export class StreamingBedrockStack extends cdk.Stack {
       architecture: lambda.Architecture.ARM_64,
       environment: {
         BEDROCK_MODEL_ID: "amazon.nova-pro-v1:0",
-        ALLOWED_ORIGIN: "https://yourdomain.com",
+        ALLOWED_ORIGIN: corsOrigin,
         ORIGIN_VERIFY_SECRET: originVerifySecret,
       },
     });
@@ -40,6 +46,8 @@ export class StreamingBedrockStack extends cdk.Stack {
           `arn:${cdk.Aws.PARTITION}:bedrock:${cdk.Aws.REGION}::foundation-model/anthropic.claude-3-5-haiku-20241022-v1:0`,
           `arn:${cdk.Aws.PARTITION}:bedrock:${cdk.Aws.REGION}::foundation-model/anthropic.claude-3-7-sonnet-20250219-v1:0`,
           `arn:${cdk.Aws.PARTITION}:bedrock:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:inference-profile/*`,
+          `arn:${cdk.Aws.PARTITION}:bedrock:*:*:inference-profile/us.anthropic.claude-3-7-sonnet-20250219-v1:0`,
+          `arn:${cdk.Aws.PARTITION}:bedrock:*:*:inference-profile/us.anthropic.claude-3-5-haiku-20241022-v1:0`,
         ],
       })
     );
@@ -49,8 +57,8 @@ export class StreamingBedrockStack extends cdk.Stack {
       authType: lambda.FunctionUrlAuthType.NONE,
       invokeMode: lambda.InvokeMode.RESPONSE_STREAM,
       cors: {
-        allowedOrigins: ["https://yourdomain.com"],
-        allowedMethods: [lambda.HttpMethod.ALL],
+        allowedOrigins: [corsOrigin],
+        allowedMethods: [lambda.HttpMethod.POST, lambda.HttpMethod.OPTIONS],
         allowedHeaders: ["Content-Type", "Authorization", "x-api-key", "x-origin-verify"],
       },
     });

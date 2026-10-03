@@ -15,10 +15,12 @@
     "lambda",
     "bedrock",
     "streaming",
-    "claude-3-5-sonnet",
+    "bedrock-streaming",
+    "nova-pro",
+    "claude-3-7-sonnet",
     "serverless",
     "response-streaming"
   ],
-  "author": "AWS Community / Dev.to",
+  "author": "Varun Sharma",
   "license": "MIT"
 }

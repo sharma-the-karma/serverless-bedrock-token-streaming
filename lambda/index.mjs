@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import {
   BedrockRuntimeClient,
   ConverseStreamCommand,
@@ -7,7 +8,6 @@ const bedrock = new BedrockRuntimeClient({
   region: process.env.AWS_REGION || "us-east-1",
 });
 
-// Explicit server-side allowlist pinned to supported models
 const ALLOWED_MODELS = new Set([
   "amazon.nova-pro-v1:0",
   "amazon.nova-lite-v1:0",
@@ -20,8 +20,17 @@ const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "https://yourdomain.com";
 const EXPECTED_ORIGIN_VERIFY = process.env.ORIGIN_VERIFY_SECRET;
 const EXPECTED_API_KEY = process.env.APP_API_KEY;
 
-const MAX_PROMPT_CHARS = 4000;
+const MAX_TOTAL_PROMPT_CHARS = 4000;
+const MAX_SYSTEM_CHARS = 1000;
 const MAX_BODY_BYTES = 50 * 1024; // 50 KB
+
+function safeCompare(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
 
 export const handler = awslambda.streamifyResponse(
   async (event, responseStream, context) => {
@@ -31,7 +40,7 @@ export const handler = awslambda.streamifyResponse(
       "Connection": "keep-alive",
       "X-Accel-Buffering": "no",
       "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Methods": "POST, OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type, Authorization, x-api-key, x-origin-verify",
     };
 
@@ -49,7 +58,7 @@ export const handler = awslambda.streamifyResponse(
     // Origin verification guard: Ensures requests route through CloudFront
     if (EXPECTED_ORIGIN_VERIFY) {
       const originHeader = event.headers?.["x-origin-verify"] || event.headers?.["X-Origin-Verify"];
-      if (originHeader !== EXPECTED_ORIGIN_VERIFY) {
+      if (!safeCompare(originHeader, EXPECTED_ORIGIN_VERIFY)) {
         const forbiddenResponse = awslambda.HttpResponseStream.from(responseStream, {
           statusCode: 403,
           headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": ALLOWED_ORIGIN },
@@ -60,10 +69,10 @@ export const handler = awslambda.streamifyResponse(
       }
     }
 
-    // Optional application-layer API key validation
+    // Constant-time application-layer API key validation when configured
     if (EXPECTED_API_KEY) {
       const requestApiKey = event.headers?.["x-api-key"] || event.headers?.["X-Api-Key"];
-      if (requestApiKey !== EXPECTED_API_KEY) {
+      if (!safeCompare(requestApiKey, EXPECTED_API_KEY)) {
         const unauthorizedResponse = awslambda.HttpResponseStream.from(responseStream, {
           statusCode: 401,
           headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": ALLOWED_ORIGIN },
@@ -121,10 +130,33 @@ export const handler = awslambda.streamifyResponse(
         if (event.queryStringParameters.modelId) modelId = String(event.queryStringParameters.modelId);
       }
 
-      // Input validation: Prompt length cap
-      if (prompt.length > MAX_PROMPT_CHARS) {
+      // Input validation: System prompt length cap
+      if (systemPrompt.length > MAX_SYSTEM_CHARS) {
         sendSSE(
-          { error: true, message: `Prompt exceeds maximum allowed length of ${MAX_PROMPT_CHARS} characters.` },
+          { error: true, message: `System prompt exceeds maximum allowed length of ${MAX_SYSTEM_CHARS} characters.` },
+          "error"
+        );
+        stream.end();
+        return;
+      }
+
+      // Input validation: Calculate total characters across prompt or messages array
+      let totalInputChars = 0;
+      if (conversationHistory.length > 0) {
+        for (const msg of conversationHistory) {
+          if (Array.isArray(msg.content)) {
+            for (const part of msg.content) {
+              if (part.text) totalInputChars += String(part.text).length;
+            }
+          }
+        }
+      } else {
+        totalInputChars = prompt.length;
+      }
+
+      if (totalInputChars > MAX_TOTAL_PROMPT_CHARS) {
+        sendSSE(
+          { error: true, message: `Total input text (${totalInputChars} chars) exceeds maximum allowed length of ${MAX_TOTAL_PROMPT_CHARS} characters.` },
           "error"
         );
         stream.end();
@@ -162,6 +194,9 @@ export const handler = awslambda.streamifyResponse(
 
       const bedrockResponse = await bedrock.send(command);
 
+      let stopReason = null;
+      let tokenUsage = null;
+
       for await (const chunk of bedrockResponse.stream) {
         if (chunk.contentBlockDelta?.delta?.text) {
           sendSSE({
@@ -171,12 +206,19 @@ export const handler = awslambda.streamifyResponse(
         }
 
         if (chunk.messageStop) {
-          sendSSE({
-            stopReason: chunk.messageStop.stopReason,
-            usage: chunk.metadata?.usage,
-          }, "done");
+          stopReason = chunk.messageStop.stopReason;
+        }
+
+        if (chunk.metadata?.usage) {
+          tokenUsage = chunk.metadata.usage;
         }
       }
+
+      // Send completion event with both stopReason and usage metrics populated
+      sendSSE({
+        stopReason,
+        usage: tokenUsage,
+      }, "done");
     } catch (err) {
       console.error("Bedrock stream error:", err);
       sendSSE(
