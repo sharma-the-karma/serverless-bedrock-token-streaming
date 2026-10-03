@@ -1,0 +1,24 @@
+{
+  "name": "bedrock-lambda-streaming-node",
+  "version": "1.0.0",
+  "description": "Serverless token-by-token streaming with Amazon Bedrock ConverseStream and AWS Lambda Response Streaming",
+  "type": "module",
+  "main": "index.mjs",
+  "scripts": {
+    "test": "node local-test.mjs"
+  },
+  "dependencies": {
+    "@aws-sdk/client-bedrock-runtime": "^3.670.0"
+  },
+  "keywords": [
+    "aws",
+    "lambda",
+    "bedrock",
+    "streaming",
+    "claude-3-5-sonnet",
+    "serverless",
+    "response-streaming"
+  ],
+  "author": "AWS Community / Dev.to",
+  "license": "MIT"
+}

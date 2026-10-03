@@ -1,0 +1,131 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Serverless Token Streaming with Amazon Bedrock ConverseStream,
+  AWS Lambda Response Streaming, and CloudFront.
+  Solves the 29-second API Gateway timeout and response buffering limitations.
+
+Globals:
+  Function:
+    Timeout: 300
+    MemorySize: 512
+    Runtime: nodejs20.x
+    Architectures:
+      - arm64
+    Environment:
+      Variables:
+        NODE_OPTIONS: "--enable-source-maps"
+        BEDROCK_MODEL_ID: "anthropic.claude-3-5-sonnet-20241022-v2:0"
+
+Resources:
+  # =========================================================================
+  # 1. Node.js Lambda Function with Native Response Streaming
+  # =========================================================================
+  BedrockStreamingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../lambda/
+      Handler: index.handler
+      Description: "Streams Amazon Bedrock tokens in real-time via Server-Sent Events (SSE)"
+      Policies:
+        - Statement:
+            - Sid: BedrockInvokePolicy
+              Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:InvokeModelWithResponseStream
+                - bedrock:ConverseStream
+              Resource: "*"
+      FunctionUrlConfig:
+        AuthType: NONE
+        InvokeMode: RESPONSE_STREAM # CRITICAL: Enables chunk-by-chunk HTTP streaming
+        Cors:
+          AllowOrigins:
+            - "*"
+          AllowMethods:
+            - GET
+            - POST
+            - OPTIONS
+          AllowHeaders:
+            - Content-Type
+            - Authorization
+          MaxAge: 3600
+
+  # =========================================================================
+  # 2. Python Lambda Function with AWS Lambda Web Adapter (Alternative)
+  # =========================================================================
+  BedrockPythonStreamingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      PackageType: Image
+      Description: "Python FastAPI Bedrock streamer using AWS Lambda Web Adapter"
+      Policies:
+        - Statement:
+            - Sid: BedrockInvokePolicyPython
+              Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:InvokeModelWithResponseStream
+                - bedrock:ConverseStream
+              Resource: "*"
+      FunctionUrlConfig:
+        AuthType: NONE
+        InvokeMode: RESPONSE_STREAM # CRITICAL
+        Cors:
+          AllowOrigins:
+            - "*"
+          AllowMethods:
+            - "*"
+          AllowHeaders:
+            - "*"
+    Metadata:
+      DockerTag: latest
+      DockerContext: ../lambda/python_adapter
+      Dockerfile: Dockerfile
+
+  # =========================================================================
+  # 3. CloudFront Distribution (Bypasses Buffering with CachingDisabled)
+  # =========================================================================
+  StreamingDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: "CloudFront CDN routing to Lambda Function URL without response buffering"
+        Enabled: true
+        HttpVersion: http2and3
+        Origins:
+          - Id: LambdaFunctionUrlOrigin
+            DomainName: !Select [2, !Split ["/", !GetAtt BedrockStreamingFunctionUrl.FunctionUrl]]
+            CustomOriginConfig:
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols:
+                - TLSv1.2
+        DefaultCacheBehavior:
+          TargetOriginId: LambdaFunctionUrlOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+            - PUT
+            - POST
+            - PATCH
+            - DELETE
+          # AWS Managed-CachingDisabled (ensures CloudFront does NOT buffer the SSE stream!)
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-44ca84e08fad
+          # AWS Managed-AllViewerExceptHostHeader (required for Lambda Function URLs)
+          OriginRequestPolicyId: b6847045-a537-4142-8132-7d0dc659e210
+
+Outputs:
+  NodeFunctionUrl:
+    Description: "Direct Lambda Function URL (Node.js Streaming)"
+    Value: !GetAtt BedrockStreamingFunctionUrl.FunctionUrl
+
+  PythonFunctionUrl:
+    Description: "Direct Lambda Function URL (Python FastAPI Web Adapter)"
+    Value: !GetAtt BedrockPythonStreamingFunctionUrl.FunctionUrl
+
+  CloudFrontDomain:
+    Description: "CloudFront CDN Endpoint (Edge distribution with streaming enabled)"
+    Value: !Sub "https://${StreamingDistribution.DomainName}"

@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.py[cod]
+
+# AWS SAM & CDK
+.aws-sam/
+cdk.out/
+
+# Environment and secrets
+.env
+.env.*
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Logs
+*.log

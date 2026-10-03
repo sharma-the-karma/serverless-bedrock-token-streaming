@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Bedrock Real-Time Streamer | Serverless Token Streaming</title>
+  <meta name="description" content="Ultra-fast serverless token streaming using Amazon Bedrock ConverseStream and AWS Lambda Response Streaming.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;600&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app-layout">
+    <!-- Header -->
+    <header class="app-header">
+      <div class="header-left">
+        <div class="brand-badge">
+          <span class="pulse-dot"></span>
+          <span>AWS BEDROCK</span>
+        </div>
+        <h1>Token Streaming Playground</h1>
+      </div>
+      <div class="header-right">
+        <div class="status-indicator" id="connection-status">
+          <span class="status-dot"></span>
+          <span class="status-text">Ready</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- Main Content -->
+    <div class="main-container">
+      <!-- Left Sidebar: Config & Metrics -->
+      <aside class="config-sidebar">
+        <!-- Endpoint Setup -->
+        <div class="glass-panel">
+          <h2 class="panel-title">Endpoint Configuration</h2>
+          <div class="input-group">
+            <label for="endpoint-url">Lambda Function URL / CDN Origin</label>
+            <input 
+              type="text" 
+              id="endpoint-url" 
+              placeholder="https://xxx.lambda-url.us-east-1.on.aws" 
+              value=""
+            />
+            <small class="helper-text">Supports direct Lambda Function URL or CloudFront endpoint.</small>
+          </div>
+
+          <div class="input-group">
+            <label for="mock-mode-toggle" class="checkbox-label">
+              <input type="checkbox" id="mock-mode-toggle" checked />
+              <span>Simulate Local Stream (Test Mode)</span>
+            </label>
+          </div>
+
+          <div class="input-group">
+            <label for="model-selector">Bedrock Foundation Model</label>
+            <select id="model-selector">
+              <option value="anthropic.claude-3-5-sonnet-20241022-v2:0">Anthropic Claude 3.5 Sonnet v2</option>
+              <option value="anthropic.claude-3-haiku-20240307-v1:0">Anthropic Claude 3 Haiku (Fastest)</option>
+              <option value="amazon.nova-pro-v1:0">Amazon Nova Pro</option>
+              <option value="amazon.nova-micro-v1:0">Amazon Nova Micro</option>
+              <option value="meta.llama3-70b-instruct-v1:0">Meta Llama 3 70B</option>
+            </select>
+          </div>
+
+          <div class="input-group">
+            <label for="system-prompt">System Persona</label>
+            <textarea id="system-prompt" rows="3">You are an elite AWS Cloud Architect. Answer questions with technical precision, bullet points, and code snippets.</textarea>
+          </div>
+        </div>
+
+        <!-- Telemetry & Performance HUD -->
+        <div class="glass-panel metrics-panel">
+          <h2 class="panel-title">Streaming Telemetry HUD</h2>
+          <div class="metric-grid">
+            <div class="metric-card">
+              <span class="metric-label">TTFT (First Token)</span>
+              <span class="metric-value highlight-cyan" id="metric-ttft">-- ms</span>
+            </div>
+            <div class="metric-card">
+              <span class="metric-label">Tokens Emitted</span>
+              <span class="metric-value highlight-purple" id="metric-tokens">0</span>
+            </div>
+            <div class="metric-card">
+              <span class="metric-label">Streaming Speed</span>
+              <span class="metric-value highlight-orange" id="metric-speed">-- tps</span>
+            </div>
+            <div class="metric-card">
+              <span class="metric-label">Total Duration</span>
+              <span class="metric-value" id="metric-duration">-- s</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Architecture Quick Info -->
+        <div class="glass-panel architecture-panel">
+          <h2 class="panel-title">Architecture Blueprint</h2>
+          <p class="arch-desc">
+            Bypasses the <strong>29s API Gateway hard limit</strong> and response buffering.
+          </p>
+          <div class="arch-flow">
+            <span class="flow-badge">Browser</span>
+            <span class="flow-arrow">⇄</span>
+            <span class="flow-badge">Function URL</span>
+            <span class="flow-arrow">⇄</span>
+            <span class="flow-badge">Bedrock Stream</span>
+          </div>
+        </div>
+      </aside>
+
+      <!-- Center: Chat Experience -->
+      <section class="chat-section">
+        <!-- Messages Area -->
+        <div class="messages-container" id="messages-container">
+          <div class="message-row assistant">
+            <div class="avatar bedrock-avatar">AWS</div>
+            <div class="message-content">
+              <div class="message-bubble">
+                <p><strong>Welcome to Serverless Token Streaming!</strong></p>
+                <p>This demo uses <code>awslambda.streamifyResponse()</code> with the Amazon Bedrock <code>ConverseStream</code> API. No API Gateway buffering, no 29-second timeouts.</p>
+                <p>Try one of the prompts below or type your own question!</p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Prompt Suggestions -->
+        <div class="suggestion-chips" id="suggestion-chips">
+          <button class="chip" data-prompt="Why does API Gateway buffer SSE responses and how does Lambda Function URL solve it?">
+            Why does API Gateway buffer SSE?
+          </button>
+          <button class="chip" data-prompt="Write an AWS CDK snippet configuring a Lambda Function URL with RESPONSE_STREAM invoke mode.">
+            CDK RESPONSE_STREAM snippet
+          </button>
+          <button class="chip" data-prompt="Explain the difference between Amazon Bedrock invoke_model_with_response_stream vs converse_stream.">
+            ConverseStream vs Legacy API
+          </button>
+        </div>
+
+        <!-- Chat Input Bar -->
+        <form class="chat-input-bar" id="chat-form">
+          <textarea 
+            id="prompt-input" 
+            placeholder="Ask anything about AWS architecture, Bedrock, or Serverless streaming..."
+            rows="1"
+          ></textarea>
+          <button type="submit" id="send-button" class="send-btn" title="Send message">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="m22 2-7 20-4-9-9-4Z"/>
+              <path d="M22 2 11 13"/>
+            </svg>
+          </button>
+        </form>
+      </section>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
