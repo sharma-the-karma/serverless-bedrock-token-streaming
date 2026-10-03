@@ -3,7 +3,7 @@ title: "Real-Time Token Streaming with Amazon Bedrock and AWS Lambda: Architectu
 published: true
 description: "A technical guide to streaming Bedrock tokens using Lambda Function URLs in RESPONSE_STREAM mode, addressing API Gateway tradeoffs, Python asyncio concurrency, and production security."
 tags: aws, serverless, bedrock, architecture
-cover_image: https://raw.githubusercontent.com/aws-samples/amazon-bedrock-samples/main/assets/banner.png
+cover_image: https://raw.githubusercontent.com/sharma-the-karma/serverless-bedrock-token-streaming/main/assets/cover.png
 canonical_url: https://dev.to/sharmavarun/solving-aws-reposts-1-genai-headache-real-time-token-streaming-with-amazon-bedrock-aws-lambda-37kh
 ---
 
