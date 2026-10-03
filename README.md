@@ -4,6 +4,8 @@ This repository implements token-by-token response streaming from Amazon Bedrock
 
 It uses AWS Lambda Function URLs configured with `InvokeMode: RESPONSE_STREAM`, which streams HTTP response chunks as Server-Sent Events (SSE). It includes both Node.js (Node.js 22 LTS) and Python implementations, AWS SAM and CDK infrastructure templates, and a local testing interface.
 
+> 📖 **Companion Article:** For an in-depth writeup on architecture tradeoffs, CloudFront policy requirements, and Python asyncio concurrency patterns, read the companion guide on Dev.to: [Real-Time Token Streaming with Amazon Bedrock and AWS Lambda: Architecture, Tradeoffs, and Security](https://dev.to/sharmavarun/solving-aws-reposts-1-genai-headache-real-time-token-streaming-with-amazon-bedrock-aws-lambda-37kh).
+
 ---
 
 ## Architecture Overview & Tradeoffs
@@ -52,9 +54,8 @@ Exposing a Lambda Function URL that calls Amazon Bedrock requires explicit safeg
 * `lambda/python_adapter/main.py`: Python FastAPI service using AWS Lambda Web Adapter. It consumes the blocking Boto3 `converse_stream` iterator in a background worker thread and feeds an `asyncio.Queue` to prevent event-loop starvation.
 * `lambda/python_adapter/Dockerfile`: Container image packaging FastAPI with the AWS Lambda Web Adapter.
 * `infra/template.yaml`: AWS SAM template provisioning the Function URLs with `RESPONSE_STREAM`, pinned IAM policies, and CloudFront.
-* `infra/cdk/lib/streaming-bedrock-stack.ts`: AWS CDK v2 TypeScript stack implementation.
+* `infra/cdk/`: AWS CDK v2 TypeScript stack implementation (`lib/streaming-bedrock-stack.ts`).
 * `frontend/`: Web interface (`index.html`, `style.css`, `app.js`) for testing the stream and viewing latency metrics.
-* `blog/serverless-bedrock-token-streaming.md`: Technical article detailing the architecture, CloudFront policy requirements, and asyncio concurrency considerations.
 
 ---
 

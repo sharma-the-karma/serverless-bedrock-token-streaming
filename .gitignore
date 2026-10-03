@@ -26,3 +26,7 @@ publish_to_devto.py
 # Archives
 *.zip
 
+# Local blog drafts
+blog/
+
+
