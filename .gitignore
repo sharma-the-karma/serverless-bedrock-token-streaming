@@ -17,3 +17,8 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Local authoring & generation scripts
+create_cover_image.py
+generate_demo_gif.py
+publish_to_devto.py
