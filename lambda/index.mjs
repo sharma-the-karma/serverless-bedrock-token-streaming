@@ -7,16 +7,17 @@ const bedrock = new BedrockRuntimeClient({
   region: process.env.AWS_REGION || "us-east-1",
 });
 
-// Server-side allowlist to prevent callers from invoking arbitrary/expensive models
+// Explicit server-side allowlist pinned to supported models
 const ALLOWED_MODELS = new Set([
-  "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
-  "us.anthropic.claude-3-5-haiku-20241022-v1:0",
   "amazon.nova-pro-v1:0",
   "amazon.nova-lite-v1:0",
+  "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+  "us.anthropic.claude-3-5-haiku-20241022-v1:0",
 ]);
 
-const DEFAULT_MODEL_ID = process.env.BEDROCK_MODEL_ID || "us.anthropic.claude-3-7-sonnet-20250219-v1:0";
+const DEFAULT_MODEL_ID = process.env.BEDROCK_MODEL_ID || "amazon.nova-pro-v1:0";
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "https://yourdomain.com";
+const EXPECTED_ORIGIN_VERIFY = process.env.ORIGIN_VERIFY_SECRET;
 const EXPECTED_API_KEY = process.env.APP_API_KEY;
 
 const MAX_PROMPT_CHARS = 4000;
@@ -31,7 +32,7 @@ export const handler = awslambda.streamifyResponse(
       "X-Accel-Buffering": "no",
       "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization, x-api-key",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, x-api-key, x-origin-verify",
     };
 
     // Pre-flight CORS handling
@@ -45,16 +46,32 @@ export const handler = awslambda.streamifyResponse(
       return;
     }
 
+    // Origin verification guard: Ensures requests route through CloudFront
+    if (EXPECTED_ORIGIN_VERIFY) {
+      const originHeader = event.headers?.["x-origin-verify"] || event.headers?.["X-Origin-Verify"];
+      if (originHeader !== EXPECTED_ORIGIN_VERIFY) {
+        const forbiddenResponse = awslambda.HttpResponseStream.from(responseStream, {
+          statusCode: 403,
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": ALLOWED_ORIGIN },
+        });
+        forbiddenResponse.write(JSON.stringify({ error: "Forbidden: Direct Function URL access is blocked." }));
+        forbiddenResponse.end();
+        return;
+      }
+    }
+
     // Optional application-layer API key validation
-    const requestApiKey = event.headers?.["x-api-key"] || event.headers?.["X-Api-Key"];
-    if (EXPECTED_API_KEY && requestApiKey !== EXPECTED_API_KEY) {
-      const unauthorizedResponse = awslambda.HttpResponseStream.from(responseStream, {
-        statusCode: 401,
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": ALLOWED_ORIGIN },
-      });
-      unauthorizedResponse.write(JSON.stringify({ error: "Unauthorized: Invalid x-api-key" }));
-      unauthorizedResponse.end();
-      return;
+    if (EXPECTED_API_KEY) {
+      const requestApiKey = event.headers?.["x-api-key"] || event.headers?.["X-Api-Key"];
+      if (requestApiKey !== EXPECTED_API_KEY) {
+        const unauthorizedResponse = awslambda.HttpResponseStream.from(responseStream, {
+          statusCode: 401,
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": ALLOWED_ORIGIN },
+        });
+        unauthorizedResponse.write(JSON.stringify({ error: "Unauthorized: Invalid x-api-key." }));
+        unauthorizedResponse.end();
+        return;
+      }
     }
 
     // Payload size guard

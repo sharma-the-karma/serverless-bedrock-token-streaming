@@ -3,7 +3,7 @@ Python Streaming API with Amazon Bedrock + FastAPI + AWS Lambda Web Adapter.
 
 Uses an asyncio.Queue with a background worker thread to consume the blocking
 boto3 EventStream without starving the FastAPI asyncio event loop under concurrency.
-Includes server-side model allowlist and input size caps.
+Includes server-side model allowlist, origin verification, and input size caps.
 """
 
 import os
@@ -13,8 +13,7 @@ import threading
 from typing import AsyncGenerator, Optional, List
 import boto3
 from botocore.config import Config
-from fastapi import FastAPI, HTTPException, Depends
-from fastapi.security.api_key import APIKeyHeader
+from fastapi import FastAPI, HTTPException, Security, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -31,25 +30,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-API_KEY_HEADER = APIKeyHeader(name="x-api-key", auto_error=False)
+EXPECTED_ORIGIN_VERIFY = os.getenv("ORIGIN_VERIFY_SECRET")
 EXPECTED_API_KEY = os.getenv("APP_API_KEY")
 
-def verify_api_key(api_key: Optional[str] = Depends(API_KEY_HEADER)):
-    if EXPECTED_API_KEY and api_key != EXPECTED_API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    return api_key
+def verify_request_access(
+    x_origin_verify: Optional[str] = Header(None, alias="x-origin-verify"),
+    x_api_key: Optional[str] = Header(None, alias="x-api-key"),
+):
+    if EXPECTED_ORIGIN_VERIFY and x_origin_verify != EXPECTED_ORIGIN_VERIFY:
+        raise HTTPException(status_code=403, detail="Forbidden: Direct Function URL access is blocked.")
+    if EXPECTED_API_KEY and x_api_key != EXPECTED_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized: Invalid x-api-key.")
 
 # Server-side model allowlist
 ALLOWED_MODELS = {
-    "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
-    "us.anthropic.claude-3-5-haiku-20241022-v1:0",
     "amazon.nova-pro-v1:0",
     "amazon.nova-lite-v1:0",
+    "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+    "us.anthropic.claude-3-5-haiku-20241022-v1:0",
 }
 
 DEFAULT_MODEL_ID = os.getenv(
     "BEDROCK_MODEL_ID",
-    "us.anthropic.claude-3-7-sonnet-20250219-v1:0"
+    "amazon.nova-pro-v1:0"
 )
 
 boto_config = Config(
@@ -142,7 +145,7 @@ def health_check():
     return {"status": "healthy"}
 
 @app.post("/stream")
-async def chat_stream(request: ChatRequest, _auth: Optional[str] = Depends(verify_api_key)):
+async def chat_stream(request: ChatRequest, _auth: None = Depends(verify_request_access)):
     if request.modelId not in ALLOWED_MODELS:
         raise HTTPException(
             status_code=400,

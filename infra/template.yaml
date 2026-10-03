@@ -5,16 +5,6 @@ Description: >
   AWS Lambda Response Streaming, and CloudFront.
 
 Parameters:
-  FunctionAuthType:
-    Type: String
-    Default: AWS_IAM
-    AllowedValues:
-      - AWS_IAM
-      - NONE
-    Description: >
-      Authentication mode for the Function URL. Use AWS_IAM for production (SigV4 signing).
-      Use NONE only for local sandbox testing behind an API key or WAF.
-
   CorsOrigin:
     Type: String
     Default: "https://yourdomain.com"
@@ -22,18 +12,27 @@ Parameters:
       Allowed CORS origin for the Function URL. Set to your specific frontend origin.
       Avoid wildcard '*' in production to protect against unauthorized cross-site requests.
 
+  OriginVerifySecret:
+    Type: String
+    NoEcho: true
+    Default: "ChangeMeInProductionSecretToken123!"
+    Description: >
+      Shared secret header passed by CloudFront (X-Origin-Verify) to prevent direct
+      unauthorized calls to the Function URL.
+
 Globals:
   Function:
     Timeout: 300
     MemorySize: 512
-    Runtime: nodejs20.x
+    Runtime: nodejs22.x
     Architectures:
       - arm64
     Environment:
       Variables:
         NODE_OPTIONS: "--enable-source-maps"
-        BEDROCK_MODEL_ID: "us.anthropic.claude-3-7-sonnet-20250219-v1:0"
+        BEDROCK_MODEL_ID: "amazon.nova-pro-v1:0"
         ALLOWED_ORIGIN: !Ref CorsOrigin
+        ORIGIN_VERIFY_SECRET: !Ref OriginVerifySecret
 
 Resources:
   # Node.js Lambda Function with Native Response Streaming
@@ -45,16 +44,19 @@ Resources:
       Description: "Streams Amazon Bedrock tokens in real-time via Server-Sent Events (SSE)"
       Policies:
         - Statement:
-            - Sid: BedrockScopedInvokePolicy
+            - Sid: BedrockPinnedModelInvokePolicy
               Effect: Allow
               Action:
                 - bedrock:InvokeModelWithResponseStream
                 - bedrock:ConverseStream
               Resource:
-                - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/*"
+                - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/amazon.nova-pro-v1:0"
+                - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/amazon.nova-lite-v1:0"
+                - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-5-haiku-20241022-v1:0"
+                - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-7-sonnet-20250219-v1:0"
                 - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*"
       FunctionUrlConfig:
-        AuthType: !Ref FunctionAuthType
+        AuthType: NONE # Secured via CloudFront X-Origin-Verify shared secret header validation
         InvokeMode: RESPONSE_STREAM
         Cors:
           AllowOrigins:
@@ -67,6 +69,7 @@ Resources:
             - Content-Type
             - Authorization
             - x-api-key
+            - x-origin-verify
           MaxAge: 3600
 
   # Python Lambda Function with AWS Lambda Web Adapter (Alternative)
@@ -77,16 +80,19 @@ Resources:
       Description: "Python FastAPI Bedrock streamer using AWS Lambda Web Adapter"
       Policies:
         - Statement:
-            - Sid: BedrockScopedInvokePolicyPython
+            - Sid: BedrockPinnedModelInvokePolicyPython
               Effect: Allow
               Action:
                 - bedrock:InvokeModelWithResponseStream
                 - bedrock:ConverseStream
               Resource:
-                - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/*"
+                - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/amazon.nova-pro-v1:0"
+                - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/amazon.nova-lite-v1:0"
+                - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-5-haiku-20241022-v1:0"
+                - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-7-sonnet-20250219-v1:0"
                 - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*"
       FunctionUrlConfig:
-        AuthType: !Ref FunctionAuthType
+        AuthType: NONE
         InvokeMode: RESPONSE_STREAM
         Cors:
           AllowOrigins:
@@ -118,6 +124,9 @@ Resources:
               OriginProtocolPolicy: https-only
               OriginSSLProtocols:
                 - TLSv1.2
+            OriginCustomHeaders:
+              - HeaderName: "X-Origin-Verify"
+                HeaderValue: !Ref OriginVerifySecret
         DefaultCacheBehavior:
           TargetOriginId: LambdaFunctionUrlOrigin
           ViewerProtocolPolicy: redirect-to-https
@@ -144,5 +153,5 @@ Outputs:
     Value: !GetAtt BedrockPythonStreamingFunctionUrl.FunctionUrl
 
   CloudFrontDomain:
-    Description: "CloudFront CDN Endpoint"
+    Description: "CloudFront CDN Endpoint (Public Entrypoint)"
     Value: !Sub "https://${StreamingDistribution.DomainName}"

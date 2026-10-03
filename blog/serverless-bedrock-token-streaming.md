@@ -18,34 +18,34 @@ In this guide, we examine the mechanics of serverless token streaming on AWS, co
 When serving streaming LLM responses, AWS offers two primary serverless patterns:
 
 ### Option A: Amazon API Gateway REST APIs (Response Transfer Mode: `STREAM`)
-AWS introduced native response streaming for API Gateway REST APIs, allowing integrations to stream response payloads without buffering.
-* **Pros:** Full access to API Gateway's mature operational features (API keys, usage plans, request validation, Cognito/Lambda authorizers).
-* **Cons:** Requires configuring method response transfer modes (`STREAM`), incurs API Gateway invocation charges ($3.50 per million requests), and does not apply to API Gateway HTTP APIs (which still buffer responses).
+AWS supports native response streaming for API Gateway REST APIs, allowing integrations to stream response payloads without buffering.
+* **Pros:** Full access to API Gateway features (API keys, usage plans, request validation, Cognito/Lambda authorizers).
+* **Cons:** Requires configuring method response transfer modes (`STREAM`), incurs API Gateway per-request invocation charges plus streaming data processing fees, and does not apply to API Gateway HTTP APIs (which still buffer responses).
 
 ### Option B: AWS Lambda Function URLs (`InvokeMode: RESPONSE_STREAM`)
 Lambda Function URLs provide a direct HTTPS endpoint backed by HTTP chunked transfer encoding.
 * **Pros:** Zero API Gateway provisioning overhead, zero per-request proxy fees, native chunked streaming, and direct support up to Lambda's 15-minute execution limit.
-* **Cons:** Fewer built-in API management features; authentication must be managed via IAM (SigV4), CloudFront + WAF, or an application-layer secret.
+* **Cons:** Fewer built-in API management features; authentication must be managed via CloudFront with origin verification, AWS WAF, or an application-layer check.
 
 ```mermaid
 flowchart TD
     Client[Web Browser: fetch ReadableStream] -->|SSE Stream| CF[Amazon CloudFront CDN]
-    CF -->|Chunked HTTP Transfer| FURL[Lambda Function URL: RESPONSE_STREAM]
+    CF -->|Chunked HTTP with X-Origin-Verify| FURL[Lambda Function URL: RESPONSE_STREAM]
     FURL -->|EventStream| Bedrock[Amazon Bedrock ConverseStream]
 ```
 
 ---
 
-## 2. Latency & TTFT: Measured Behavior
+## 2. Latency & TTFT: Qualitative Behavior
 
-To illustrate the user experience impact, consider a model generating a 500-token analytical response:
+To illustrate the user experience impact, consider a model generating a multi-paragraph response:
 
-* **Buffered Response:** The client receives zero bytes until generation is complete. The Time-To-First-Token equals the full generation duration (typically 5 to 9 seconds depending on model throughput).
-* **Streaming Response:** The client receives the initial token chunk as soon as the model finishes prefill processing and begins generation (typically 250ms to 400ms). The user can start reading immediately while subsequent tokens stream in over Server-Sent Events (SSE).
+* **Buffered Response:** The client receives zero bytes until generation is complete. The Time-To-First-Token equals the full generation duration (typically several seconds depending on model throughput).
+* **Streaming Response:** The client receives the initial token chunk as soon as the model finishes prefill processing and begins generation. The user can start reading immediately while subsequent tokens stream in over Server-Sent Events (SSE).
 
 ---
 
-## 3. Node.js 20+ Implementation
+## 3. Node.js 22 Implementation
 
 AWS Lambda supports native response streaming in Node.js via `awslambda.streamifyResponse()` and `awslambda.HttpResponseStream`.
 
@@ -60,8 +60,20 @@ const bedrock = new BedrockRuntimeClient({
   region: process.env.AWS_REGION || "us-east-1",
 });
 
-const DEFAULT_MODEL_ID = process.env.BEDROCK_MODEL_ID || "us.anthropic.claude-3-7-sonnet-20250219-v1:0";
+// Pinned server-side model allowlist
+const ALLOWED_MODELS = new Set([
+  "amazon.nova-pro-v1:0",
+  "amazon.nova-lite-v1:0",
+  "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+  "us.anthropic.claude-3-5-haiku-20241022-v1:0",
+]);
+
+const DEFAULT_MODEL_ID = process.env.BEDROCK_MODEL_ID || "amazon.nova-pro-v1:0";
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "https://yourdomain.com";
+const EXPECTED_ORIGIN_VERIFY = process.env.ORIGIN_VERIFY_SECRET;
+
+const MAX_PROMPT_CHARS = 4000;
+const MAX_BODY_BYTES = 50 * 1024; // 50 KB
 
 export const handler = awslambda.streamifyResponse(
   async (event, responseStream, context) => {
@@ -72,16 +84,41 @@ export const handler = awslambda.streamifyResponse(
       "X-Accel-Buffering": "no",
       "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
       "Access-Control-Allow-Methods": "POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization, x-api-key",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, x-origin-verify",
     };
 
-    // Pre-flight CORS handling
     if (event.requestContext?.http?.method === "OPTIONS") {
       const corsResponse = awslambda.HttpResponseStream.from(responseStream, {
         statusCode: 204,
         headers,
       });
       corsResponse.end();
+      return;
+    }
+
+    // Origin verification guard: Ensures requests route through CloudFront
+    if (EXPECTED_ORIGIN_VERIFY) {
+      const originHeader = event.headers?.["x-origin-verify"] || event.headers?.["X-Origin-Verify"];
+      if (originHeader !== EXPECTED_ORIGIN_VERIFY) {
+        const forbiddenResponse = awslambda.HttpResponseStream.from(responseStream, {
+          statusCode: 403,
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": ALLOWED_ORIGIN },
+        });
+        forbiddenResponse.write(JSON.stringify({ error: "Forbidden: Direct Function URL access is blocked." }));
+        forbiddenResponse.end();
+        return;
+      }
+    }
+
+    // Payload size guard
+    const rawBody = event.body || "";
+    if (Buffer.byteLength(rawBody, "utf8") > MAX_BODY_BYTES) {
+      const sizeErrResponse = awslambda.HttpResponseStream.from(responseStream, {
+        statusCode: 413,
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": ALLOWED_ORIGIN },
+      });
+      sizeErrResponse.write(JSON.stringify({ error: "Payload too large. Maximum allowed is 50 KB." }));
+      sizeErrResponse.end();
       return;
     }
 
@@ -97,8 +134,20 @@ export const handler = awslambda.streamifyResponse(
 
     try {
       const body = event.body ? JSON.parse(event.body) : {};
-      const prompt = body.prompt || "Explain distributed consensus in two sentences.";
-      const modelId = body.modelId || DEFAULT_MODEL_ID;
+      const prompt = String(body.prompt || "Explain distributed consensus in two sentences.");
+      const modelId = String(body.modelId || DEFAULT_MODEL_ID);
+
+      if (prompt.length > MAX_PROMPT_CHARS) {
+        sendSSE({ error: true, message: `Prompt exceeds ${MAX_PROMPT_CHARS} character limit.` }, "error");
+        stream.end();
+        return;
+      }
+
+      if (!ALLOWED_MODELS.has(modelId)) {
+        sendSSE({ error: true, message: `Model '${modelId}' is not permitted.` }, "error");
+        stream.end();
+        return;
+      }
 
       sendSSE({ status: "connected", modelId }, "init");
 
@@ -156,19 +205,30 @@ import asyncio
 import threading
 from typing import AsyncGenerator
 import boto3
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 app = FastAPI()
 bedrock = boto3.client("bedrock-runtime", region_name="us-east-1")
 _STREAM_END = object()
 
+ALLOWED_MODELS = {
+    "amazon.nova-pro-v1:0",
+    "amazon.nova-lite-v1:0",
+    "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+    "us.anthropic.claude-3-5-haiku-20241022-v1:0",
+}
+
 class ChatRequest(BaseModel):
-    prompt: str
-    modelId: str = "us.anthropic.claude-3-7-sonnet-20250219-v1:0"
+    prompt: str = Field(..., max_length=4000)
+    modelId: str = Field("amazon.nova-pro-v1:0")
 
 async def stream_bedrock_events(request: ChatRequest) -> AsyncGenerator[str, None]:
+    if request.modelId not in ALLOWED_MODELS:
+        yield f"event: error\ndata: {json.dumps({'error': f'Model {request.modelId} not allowed.'})}\n\n"
+        return
+
     queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
 
@@ -184,7 +244,6 @@ async def stream_bedrock_events(request: ChatRequest) -> AsyncGenerator[str, Non
         except Exception as e:
             loop.call_soon_threadsafe(queue.put_nowait, e)
 
-    # Run blocking I/O on a dedicated thread
     threading.Thread(target=worker, daemon=True).start()
 
     yield f"event: init\ndata: {json.dumps({'status': 'connected'})}\n\n"
@@ -218,29 +277,32 @@ Pair this with the **AWS Lambda Web Adapter** (`AWS_LWA_INVOKE_MODE=response_str
 
 ## 5. Security & Billing Safeguards: Critical Checklist
 
-Exposing a Lambda Function URL that calls Amazon Bedrock requires explicit access control. Deploying with `AuthType: NONE`, wildcard CORS (`*`), and unrestricted IAM permissions creates severe financial exposure—anyone who discovers the URL can invoke the model and drive up AWS charges.
+Exposing a Lambda Function URL that calls Amazon Bedrock requires explicit access control. Deploying without origin protection and with unrestricted IAM permissions creates severe financial exposure—anyone who discovers the URL can invoke the model and drive up AWS charges.
 
 ### Production Hardening Steps:
 
-1. **Use `AuthType: AWS_IAM`:** Require clients to sign requests using AWS Signature Version 4 (SigV4). If frontends cannot sign requests directly, route through CloudFront with Lambda@Edge / CloudFront Functions to sign requests or validate JSON Web Tokens (JWTs).
-2. **Scope IAM Execution Roles:** Never grant `Resource: "*"`. Restrict the Lambda execution policy to the specific foundation model ARNs and regional inference profile ARNs required:
+1. **Origin Verification with CloudFront:** Because CloudFront Origin Access Control (OAC) with Lambda Function URLs has limitations signing HTTP `POST` request bodies, forward a custom header (`X-Origin-Verify`) containing a shared secret from CloudFront, and validate it in the Lambda handler to reject direct calls.
+2. **Scope IAM Execution Roles:** Never grant `Resource: "*"`. Pin the Lambda execution policy strictly to the specific foundation model ARNs and regional inference profile ARNs:
    ```yaml
    - Effect: Allow
      Action:
        - bedrock:InvokeModelWithResponseStream
        - bedrock:ConverseStream
      Resource:
-       - "arn:aws:bedrock:*::foundation-model/*"
-       - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*"
+       - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/amazon.nova-pro-v1:0"
+       - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/amazon.nova-lite-v1:0"
+       - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-5-haiku-20241022-v1:0"
+       - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-7-sonnet-20250219-v1:0"
+       - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*"
    ```
 3. **Restrict CORS:** Explicitly whitelist your domain in `AllowOrigins`. Wildcard CORS (`*`) allows unauthorized web origins to make cross-site calls to your endpoint.
-4. **Deploy CloudFront with AWS WAF:** Place AWS WAF in front of CloudFront to enforce rate limits, geo-restrictions, and bot control. Validate a shared secret header (`X-Origin-Verify`) at the Lambda layer so requests cannot bypass CloudFront.
-5. **Enforce a Server-Side Model Allowlist:** Never allow clients to pass arbitrary `modelId` values. Validate incoming model IDs against a strict server-side allowlist to prevent callers from invoking unexpected or high-cost models.
+4. **Deploy CloudFront with AWS WAF:** Place AWS WAF in front of CloudFront to enforce rate limits, geo-restrictions, and bot control.
+5. **Enforce a Server-Side Model Allowlist:** Never allow clients to pass arbitrary `modelId` values. Validate incoming model IDs against a strict server-side allowlist.
 6. **Input Validation & Payload Guards:** Validate prompt character lengths (e.g., max 4,000 characters) and request body sizes (e.g., max 50 KB) before dispatching to Bedrock.
 
 ### Response Streaming Bandwidth and Cost Notes
 * **Bandwidth Behavior:** AWS Lambda response streaming delivers an initial 6 MB unthrottled burst, after which subsequent throughput is capped at 2 MB/s (16 Mbps), up to a maximum payload size of 200 MB. For text-based LLM token streaming, this bandwidth ceiling is far higher than the generation throughput of current foundation models.
-* **Billing Mechanics:** While Function URLs avoid API Gateway's $3.50 per million request charge, standard Lambda execution duration (billed in 1ms increments), memory allocation, and AWS Data Transfer Out still apply.
+* **Billing Mechanics:** While Function URLs avoid API Gateway request invocation fees, standard Lambda execution duration (billed in 1ms increments), memory allocation, and AWS Data Transfer Out still apply.
 
 ---
 
@@ -253,51 +315,17 @@ When routing CloudFront to a streaming Lambda Function URL, two AWS-managed poli
 
 ---
 
-## 7. Client-Side Consumption via `fetch()`
+## 7. Limitations & Tradeoffs
 
-Instead of `EventSource` (which only supports GET requests), consume the SSE stream using modern `fetch()` with `ReadableStreamDefaultReader`:
-
-```javascript
-async function streamChat(prompt, onToken) {
-  const response = await fetch("https://your-lambda-url.on.aws/", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ prompt }),
-  });
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop(); // Retain incomplete line
-
-    for (const line of lines) {
-      if (line.startsWith("data:")) {
-        try {
-          const payload = json.parse(line.replace("data:", "").trim());
-          if (payload.text) {
-            onToken(payload.text);
-          }
-        } catch {
-          // Ignore heartbeats or partial JSON
-        }
-      }
-    }
-  }
-}
-```
+* **When API Gateway is Better:** If your application requires built-in API keys, tiered usage plans, request schema validation, or integration with existing REST API ecosystems, API Gateway REST APIs with `STREAM` transfer mode provide a more comprehensive platform.
+* **Cost Risk:** Even with prompt caps and model allowlists, public-facing LLM endpoints can be abused to consume Bedrock quotas. For production applications, always place AWS WAF with rate limiting in front of CloudFront.
+* **Note on Project Origin:** This reference architecture was initially scaffolded with AI assistance and subsequently reviewed, audited, and hardened against current AWS documentation.
 
 ---
 
 ## Conclusion & Code Repository
 
-Serverless token streaming with Amazon Bedrock provides an excellent balance between low latency and cost efficiency. Whether you choose API Gateway REST APIs in `STREAM` mode or direct Lambda Function URLs, ensuring non-blocking event loop iteration in Python and locking down authentication and CORS are essential for production readiness.
+Serverless token streaming with Amazon Bedrock provides an effective balance between low latency and cost efficiency. Whether you choose API Gateway REST APIs in `STREAM` mode or direct Lambda Function URLs, ensuring non-blocking event loop iteration in Python and locking down authentication and CORS are essential for production readiness.
 
 The complete code, SAM template, and CDK stack are open-source and available here:
 
