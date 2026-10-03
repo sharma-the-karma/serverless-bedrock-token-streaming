@@ -7,6 +7,8 @@
 
 > **Solving the #1 GenAI headache trending on [AWS re:Post](https://repost.aws/):** How to stream tokens from Amazon Bedrock in real time to web clients without hitting API Gateway's 29-second timeout or response buffering.
 
+![Bedrock Token Streaming Demo](./assets/streaming-demo.gif)
+
 ---
 
 ## 📖 The Problem
