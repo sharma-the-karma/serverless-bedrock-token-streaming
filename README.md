@@ -1,93 +1,121 @@
 # Serverless Amazon Bedrock Token Streaming
 
-[![AWS Lambda](https://img.shields.io/badge/AWS-Lambda%20Response%20Streaming-orange?logo=amazon-aws)](https://docs.aws.amazon.com/lambda/latest/dg/configuration-response-streaming.html)
-[![Amazon Bedrock](https://img.shields.io/badge/Amazon-Bedrock%20ConverseStream-blueviolet?logo=amazon-aws)](https://aws.amazon.com/bedrock/)
-[![Dev.to Article](https://img.shields.io/badge/Dev.to-Article-black?logo=dev-to)](./blog/serverless-bedrock-token-streaming.md)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
+This repository implements token-by-token response streaming from Amazon Bedrock models through AWS Lambda to web clients.
 
-A reference architecture for streaming generative AI tokens from Amazon Bedrock directly to web clients using **AWS Lambda Function URLs** in `RESPONSE_STREAM` mode with CloudFront.
+It uses AWS Lambda Function URLs configured with `InvokeMode: RESPONSE_STREAM`, which streams HTTP response chunks as Server-Sent Events (SSE). It includes both Node.js and Python implementations, AWS SAM and CDK infrastructure templates, and an interactive local testing interface.
 
 ---
 
-## Architecture Overview
+## Background & Architecture Tradeoffs
 
-When building token-streaming applications with Amazon Bedrock, developers generally choose between two primary serverless patterns:
+When building generative AI interfaces on AWS, responses can take tens of seconds to complete. Exposing streams to frontends is typically done via one of two paths:
 
-1. **Amazon API Gateway REST APIs with `STREAM` transfer mode** (native streaming support for REST APIs, with usage plans, API keys, and custom authorizers).
-2. **AWS Lambda Function URLs with `RESPONSE_STREAM`** (direct HTTPS invocation, minimal proxy overhead, lower per-request cost, and native HTTP chunked streaming).
-
-This repository demonstrates the Function URL pattern:
+1. **Amazon API Gateway REST APIs (Transfer Mode: `STREAM`)**: API Gateway REST APIs support native response streaming and customizable timeouts. This is appropriate when you need API Gateway features such as usage plans, API keys, request validation, or Cognito authorizers, but incurs API Gateway per-request charges ($3.50 per million calls) and requires method-level configuration. Note that API Gateway HTTP APIs do not support response streaming and will buffer responses.
+2. **AWS Lambda Function URLs (`InvokeMode: RESPONSE_STREAM`)**: Function URLs provide a direct HTTPS endpoint with native HTTP chunked transfer encoding. This eliminates the API Gateway layer and its per-request costs, but requires managing authentication and access control directly or via CloudFront.
 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor User as Web Client (fetch ReadableStream)
-    participant CloudFront as CloudFront CDN (CachingDisabled)
+    actor Client as Web Browser
+    participant CloudFront as CloudFront CDN
     participant Lambda as Lambda Function URL (RESPONSE_STREAM)
     participant Bedrock as Amazon Bedrock (ConverseStream)
 
-    User->>CloudFront: POST /stream (Prompt, Model)
+    Client->>CloudFront: POST /stream (Prompt, Model)
     CloudFront->>Lambda: Forward HTTP Chunked Request
     Lambda->>Bedrock: ConverseStreamCommand(modelId, messages)
-    Bedrock-->>Lambda: EventStream token chunk (delta)
+    Bedrock-->>Lambda: EventStream token chunks
     Lambda-->>CloudFront: SSE chunk (event: delta)
-    CloudFront-->>User: Token displayed in real-time
-    Bedrock-->>Lambda: messageStop + usage metrics
-    Lambda-->>User: SSE event: done + stream.end()
+    CloudFront-->>Client: Streamed chunk delivered to client
+    Bedrock-->>Lambda: messageStop + usage metadata
+    Lambda-->>Client: SSE event: done + stream.end()
 ```
 
 ---
 
-## Repository Layout
+## Security & Authentication
 
-* **`lambda/`**
-  * `index.mjs`: Node.js 20 streaming handler using `awslambda.streamifyResponse` and Bedrock ConverseStream
-  * `local-test.mjs`: Local simulation script for testing stream behavior without AWS credentials
-  * `package.json`: AWS SDK v3 Bedrock runtime dependencies
-  * `python_adapter/`: Python FastAPI implementation using AWS Lambda Web Adapter with non-blocking async worker thread
-* **`infra/`**
-  * `template.yaml`: AWS SAM template with scoped IAM policies, configurable auth (`AWS_IAM` / `NONE`), and CloudFront
-  * `cdk/`: AWS CDK v2 TypeScript stack implementation
-* **`frontend/`**
-  * `index.html`, `style.css`, `app.js`: Dark-mode testing playground with live telemetry HUD (TTFT, tokens/sec, latency)
-* **`blog/`**
-  * `serverless-bedrock-token-streaming.md`: Technical walkthrough and architectural analysis
-* **`publish_to_devto.py`**: CLI script to publish or update the article on Dev.to
+Deploying a Lambda Function URL that calls Amazon Bedrock without authentication and with wildcard CORS (`*`) creates a financial risk, as anyone with the URL can incur model inference charges.
+
+This repository implements the following security controls:
+
+* **Authentication:** The SAM template parameter `FunctionAuthType` defaults to `AWS_IAM`. Callers must sign requests with AWS SigV4. For browser clients that cannot sign with IAM, route through CloudFront with AWS WAF rate limiting, or validate an API key or JWT header at the application layer.
+* **IAM Scoping:** Execution policies are scoped to foundation models (`arn:aws:bedrock:*::foundation-model/*`) and regional inference profile ARNs, rather than `Resource: "*"`.
+* **CORS:** The `CorsOrigin` parameter restricts allowed origins to your domain.
 
 ---
 
-## Security Considerations
+## Project Structure
 
-When deploying Function URLs connected to generative AI models:
-
-* **Authentication:** The SAM template parameter `FunctionAuthType` defaults to `AWS_IAM`. In production, ensure requests are signed with AWS SigV4, or route through CloudFront with AWS WAF rate-limiting.
-* **IAM Scope:** The execution role policy is scoped specifically to Bedrock foundation models (`arn:aws:bedrock:*::foundation-model/*`) and regional inference profile ARNs.
-* **CORS:** Restrict `CorsOrigin` to your specific domain rather than wildcard `*` to prevent unauthorized origins from consuming model tokens.
+* `lambda/index.mjs`: Node.js 20 streaming handler using `awslambda.streamifyResponse` and the Bedrock `ConverseStreamCommand`.
+* `lambda/python_adapter/main.py`: Python FastAPI service using AWS Lambda Web Adapter. It consumes the blocking Boto3 `converse_stream` iterator in a background worker thread and feeds an `asyncio.Queue` to prevent event-loop starvation.
+* `lambda/python_adapter/Dockerfile`: Container image packaging FastAPI with the AWS Lambda Web Adapter.
+* `infra/template.yaml`: AWS SAM template provisioning the Function URLs with `RESPONSE_STREAM`, scoped IAM policies, and CloudFront.
+* `infra/cdk/lib/streaming-bedrock-stack.ts`: AWS CDK v2 TypeScript stack implementation.
+* `frontend/`: Web interface (`index.html`, `style.css`, `app.js`) for testing the stream and viewing latency metrics.
+* `blog/serverless-bedrock-token-streaming.md`: Technical article detailing the architecture, CloudFront policy requirements, and asyncio concurrency considerations.
 
 ---
 
-## Quickstart
+## Deployment
 
-### 1. Test the Frontend Locally
-Open `frontend/index.html` in your browser (or use `python -m http.server 3000 -d frontend`). The built-in simulator mode runs immediately without AWS deployment.
+### Prerequisites
+* AWS CLI configured with credentials that have permissions to deploy Lambda, IAM, and CloudFront.
+* Amazon Bedrock model access enabled in your region (default: `us.anthropic.claude-3-7-sonnet-20250219-v1:0` or `amazon.nova-pro-v1:0`).
 
-### 2. Deploy to AWS with SAM
+### Deploy via AWS SAM
+
 ```bash
 cd infra
 sam build
 sam deploy --guided
 ```
 
+Key SAM parameters:
+* `FunctionAuthType`: Set to `AWS_IAM` for production, or `NONE` for sandbox testing behind an API key.
+* `CorsOrigin`: Set to your frontend domain (e.g. `https://app.example.com`).
+
 Outputs:
-* `NodeFunctionUrl`: Streaming Lambda endpoint
-* `CloudFrontDomain`: Edge CDN distribution with `CachingDisabled` policy
+* `NodeFunctionUrl`: Direct Lambda streaming endpoint.
+* `CloudFrontDomain`: CloudFront distribution configured with `CachingDisabled` (`4135ea2d-6df8-44a3-9df3-44ca84e08fad`) and `AllViewerExceptHostHeader` (`b689b0a8-53d0-40ab-baf2-68738e2966ac`).
+
+### Deploy via AWS CDK
+
+```bash
+cd infra/cdk
+npm install
+cdk deploy
+```
 
 ---
 
-## Detailed Article
+## Local Development & Testing
 
-For a deep dive into API Gateway tradeoffs, Python asyncio worker thread patterns, and CloudFront origin request policies, see:
-[**`blog/serverless-bedrock-token-streaming.md`**](./blog/serverless-bedrock-token-streaming.md)
+### 1. Interactive Web Interface
+Run a local static server to test the web client:
+
+```bash
+python -m http.server 3000 -d frontend
+```
+
+Open `http://localhost:3000`. By default, the interface includes a local simulator mode for testing the UI and stream parsing without AWS credentials. Enter your deployed Function URL and uncheck simulator mode to test against live infrastructure.
+
+### 2. Node.js Local Invocation
+Run the local test harness to verify the handler:
+
+```bash
+cd lambda
+npm install
+node local-test.mjs
+```
+
+### 3. Python Adapter Local Invocation
+```bash
+cd lambda/python_adapter
+pip install -r requirements.txt
+python main.py
+```
+Test endpoint at `http://localhost:8080/stream`.
 
 ---
 

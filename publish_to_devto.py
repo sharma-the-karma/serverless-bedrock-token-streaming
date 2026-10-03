@@ -89,7 +89,7 @@ def publish_or_update_article(api_key: str, file_path: str = DEFAULT_BLOG_FILE, 
         headers={
             "api-key": api_key,
             "Content-Type": "application/json",
-            "User-Agent": "AntigravityDevToPublisher/1.0"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
         }
     )
 
