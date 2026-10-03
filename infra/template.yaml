@@ -17,8 +17,10 @@ Parameters:
 
   CorsOrigin:
     Type: String
-    Default: "*"
-    Description: Allowed CORS origin for the Function URL.
+    Default: "https://yourdomain.com"
+    Description: >
+      Allowed CORS origin for the Function URL. Set to your specific frontend origin.
+      Avoid wildcard '*' in production to protect against unauthorized cross-site requests.
 
 Globals:
   Function:

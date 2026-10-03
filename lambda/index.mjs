@@ -7,9 +7,20 @@ const bedrock = new BedrockRuntimeClient({
   region: process.env.AWS_REGION || "us-east-1",
 });
 
+// Server-side allowlist to prevent callers from invoking arbitrary/expensive models
+const ALLOWED_MODELS = new Set([
+  "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+  "us.anthropic.claude-3-5-haiku-20241022-v1:0",
+  "amazon.nova-pro-v1:0",
+  "amazon.nova-lite-v1:0",
+]);
+
 const DEFAULT_MODEL_ID = process.env.BEDROCK_MODEL_ID || "us.anthropic.claude-3-7-sonnet-20250219-v1:0";
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "https://yourdomain.com";
 const EXPECTED_API_KEY = process.env.APP_API_KEY;
+
+const MAX_PROMPT_CHARS = 4000;
+const MAX_BODY_BYTES = 50 * 1024; // 50 KB
 
 export const handler = awslambda.streamifyResponse(
   async (event, responseStream, context) => {
@@ -34,7 +45,7 @@ export const handler = awslambda.streamifyResponse(
       return;
     }
 
-    // Optional API key validation when configured
+    // Optional application-layer API key validation
     const requestApiKey = event.headers?.["x-api-key"] || event.headers?.["X-Api-Key"];
     if (EXPECTED_API_KEY && requestApiKey !== EXPECTED_API_KEY) {
       const unauthorizedResponse = awslambda.HttpResponseStream.from(responseStream, {
@@ -43,6 +54,18 @@ export const handler = awslambda.streamifyResponse(
       });
       unauthorizedResponse.write(JSON.stringify({ error: "Unauthorized: Invalid x-api-key" }));
       unauthorizedResponse.end();
+      return;
+    }
+
+    // Payload size guard
+    const rawBody = event.body || "";
+    if (Buffer.byteLength(rawBody, "utf8") > MAX_BODY_BYTES) {
+      const sizeErrResponse = awslambda.HttpResponseStream.from(responseStream, {
+        statusCode: 413,
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": ALLOWED_ORIGIN },
+      });
+      sizeErrResponse.write(JSON.stringify({ error: "Payload too large. Maximum allowed is 50 KB." }));
+      sizeErrResponse.end();
       return;
     }
 
@@ -57,20 +80,51 @@ export const handler = awslambda.streamifyResponse(
     };
 
     try {
-      let prompt = "Explain quantum computing in 3 simple sentences.";
-      let systemPrompt = "You are a concise, helpful AI technical assistant.";
+      let prompt = "Explain distributed consensus in two sentences.";
+      let systemPrompt = "You are a concise technical assistant.";
       let modelId = DEFAULT_MODEL_ID;
       let conversationHistory = [];
 
       if (event.body) {
-        const body = typeof event.body === "string" ? JSON.parse(event.body) : event.body;
-        if (body.prompt) prompt = body.prompt;
-        if (body.system) systemPrompt = body.system;
-        if (body.modelId) modelId = body.modelId;
+        let body;
+        try {
+          body = typeof event.body === "string" ? JSON.parse(event.body) : event.body;
+        } catch {
+          sendSSE({ error: true, message: "Invalid JSON request body." }, "error");
+          stream.end();
+          return;
+        }
+
+        if (body.prompt) prompt = String(body.prompt);
+        if (body.system) systemPrompt = String(body.system);
+        if (body.modelId) modelId = String(body.modelId);
         if (Array.isArray(body.messages)) conversationHistory = body.messages;
       } else if (event.queryStringParameters?.prompt) {
-        prompt = event.queryStringParameters.prompt;
-        if (event.queryStringParameters.modelId) modelId = event.queryStringParameters.modelId;
+        prompt = String(event.queryStringParameters.prompt);
+        if (event.queryStringParameters.modelId) modelId = String(event.queryStringParameters.modelId);
+      }
+
+      // Input validation: Prompt length cap
+      if (prompt.length > MAX_PROMPT_CHARS) {
+        sendSSE(
+          { error: true, message: `Prompt exceeds maximum allowed length of ${MAX_PROMPT_CHARS} characters.` },
+          "error"
+        );
+        stream.end();
+        return;
+      }
+
+      // Security check: Server-side model allowlist
+      if (!ALLOWED_MODELS.has(modelId)) {
+        sendSSE(
+          {
+            error: true,
+            message: `Model '${modelId}' is not permitted. Allowed models: ${Array.from(ALLOWED_MODELS).join(", ")}`,
+          },
+          "error"
+        );
+        stream.end();
+        return;
       }
 
       const messages = conversationHistory.length > 0
@@ -91,44 +145,23 @@ export const handler = awslambda.streamifyResponse(
 
       const bedrockResponse = await bedrock.send(command);
 
-      let fullResponseText = "";
-      let tokenUsage = null;
-      const startTime = Date.now();
-      let firstTokenTime = null;
-
       for await (const chunk of bedrockResponse.stream) {
         if (chunk.contentBlockDelta?.delta?.text) {
-          if (!firstTokenTime) {
-            firstTokenTime = Date.now();
-            sendSSE({ ttftMs: firstTokenTime - startTime }, "metric_ttft");
-          }
-
-          const textChunk = chunk.contentBlockDelta.delta.text;
-          fullResponseText += textChunk;
-
           sendSSE({
-            text: textChunk,
+            text: chunk.contentBlockDelta.delta.text,
             index: chunk.contentBlockDelta.contentBlockIndex,
           }, "delta");
-        }
-
-        if (chunk.metadata?.usage) {
-          tokenUsage = chunk.metadata.usage;
         }
 
         if (chunk.messageStop) {
           sendSSE({
             stopReason: chunk.messageStop.stopReason,
-            metrics: {
-              totalDurationMs: Date.now() - startTime,
-              ttftMs: firstTokenTime ? firstTokenTime - startTime : null,
-              usage: tokenUsage,
-            },
+            usage: chunk.metadata?.usage,
           }, "done");
         }
       }
     } catch (err) {
-      console.error("Streaming execution failed:", err);
+      console.error("Bedrock stream error:", err);
       sendSSE(
         {
           error: true,

@@ -235,6 +235,12 @@ Exposing a Lambda Function URL that calls Amazon Bedrock requires explicit acces
    ```
 3. **Restrict CORS:** Explicitly whitelist your domain in `AllowOrigins`. Wildcard CORS (`*`) allows unauthorized web origins to make cross-site calls to your endpoint.
 4. **Deploy CloudFront with AWS WAF:** Place AWS WAF in front of CloudFront to enforce rate limits, geo-restrictions, and bot control. Validate a shared secret header (`X-Origin-Verify`) at the Lambda layer so requests cannot bypass CloudFront.
+5. **Enforce a Server-Side Model Allowlist:** Never allow clients to pass arbitrary `modelId` values. Validate incoming model IDs against a strict server-side allowlist to prevent callers from invoking unexpected or high-cost models.
+6. **Input Validation & Payload Guards:** Validate prompt character lengths (e.g., max 4,000 characters) and request body sizes (e.g., max 50 KB) before dispatching to Bedrock.
+
+### Response Streaming Bandwidth and Cost Notes
+* **Bandwidth Behavior:** AWS Lambda response streaming delivers an initial 6 MB unthrottled burst, after which subsequent throughput is capped at 2 MB/s (16 Mbps), up to a maximum payload size of 200 MB. For text-based LLM token streaming, this bandwidth ceiling is far higher than the generation throughput of current foundation models.
+* **Billing Mechanics:** While Function URLs avoid API Gateway's $3.50 per million request charge, standard Lambda execution duration (billed in 1ms increments), memory allocation, and AWS Data Transfer Out still apply.
 
 ---
 

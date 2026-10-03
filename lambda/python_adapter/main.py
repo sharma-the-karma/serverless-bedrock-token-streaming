@@ -3,6 +3,7 @@ Python Streaming API with Amazon Bedrock + FastAPI + AWS Lambda Web Adapter.
 
 Uses an asyncio.Queue with a background worker thread to consume the blocking
 boto3 EventStream without starving the FastAPI asyncio event loop under concurrency.
+Includes server-side model allowlist and input size caps.
 """
 
 import os
@@ -12,16 +13,15 @@ import threading
 from typing import AsyncGenerator, Optional, List
 import boto3
 from botocore.config import Config
-from fastapi import FastAPI, HTTPException, Security, Depends
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 app = FastAPI(title="Bedrock Serverless Python Streamer")
 
-# Restrict CORS to allowed origins (configured via environment variable in production)
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "https://yourdomain.com").split(",")
 
 app.add_middleware(
     CORSMiddleware,
@@ -31,7 +31,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Optional API key protection for production use
 API_KEY_HEADER = APIKeyHeader(name="x-api-key", auto_error=False)
 EXPECTED_API_KEY = os.getenv("APP_API_KEY")
 
@@ -40,7 +39,19 @@ def verify_api_key(api_key: Optional[str] = Depends(API_KEY_HEADER)):
         raise HTTPException(status_code=401, detail="Unauthorized")
     return api_key
 
-# Configure Boto3 Bedrock Runtime Client with retries and connection reuse
+# Server-side model allowlist
+ALLOWED_MODELS = {
+    "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+    "us.anthropic.claude-3-5-haiku-20241022-v1:0",
+    "amazon.nova-pro-v1:0",
+    "amazon.nova-lite-v1:0",
+}
+
+DEFAULT_MODEL_ID = os.getenv(
+    "BEDROCK_MODEL_ID",
+    "us.anthropic.claude-3-7-sonnet-20250219-v1:0"
+)
+
 boto_config = Config(
     retries={"max_attempts": 3, "mode": "standard"},
     connect_timeout=10,
@@ -53,48 +64,39 @@ bedrock_runtime = boto3.client(
     config=boto_config,
 )
 
-# Use current cross-region inference profiles or Foundation Model IDs
-DEFAULT_MODEL_ID = os.getenv(
-    "BEDROCK_MODEL_ID",
-    "us.anthropic.claude-3-7-sonnet-20250219-v1:0"
-)
-
 _STREAM_END = object()
-
 
 class ChatMessage(BaseModel):
     role: str
     content: List[dict]
 
-
 class ChatRequest(BaseModel):
-    prompt: Optional[str] = None
-    system: Optional[str] = "You are a concise, accurate AI assistant."
+    prompt: Optional[str] = Field(None, max_length=4000)
+    system: Optional[str] = Field("You are a concise, accurate AI assistant.", max_length=1000)
     modelId: Optional[str] = DEFAULT_MODEL_ID
     messages: Optional[List[ChatMessage]] = None
-    temperature: Optional[float] = 0.7
-    maxTokens: Optional[int] = 2048
-
+    temperature: Optional[float] = Field(0.7, ge=0.0, le=1.0)
+    maxTokens: Optional[int] = Field(2048, ge=1, le=4096)
 
 async def stream_bedrock_events(request: ChatRequest) -> AsyncGenerator[str, None]:
-    """
-    Consumes the blocking boto3 EventStream on a background thread and yields SSE
-    events asynchronously via an asyncio.Queue, avoiding event-loop starvation.
-    """
+    if request.modelId not in ALLOWED_MODELS:
+        yield f"event: error\ndata: {json.dumps({'error': f'Model {request.modelId} not allowed.'})}\n\n"
+        return
+
     if request.messages and len(request.messages) > 0:
         messages = [m.model_dump() for m in request.messages]
     else:
-        prompt_text = request.prompt or "Hello from Amazon Bedrock!"
+        prompt_text = request.prompt or "Explain distributed consensus in two sentences."
         messages = [{"role": "user", "content": [{"text": prompt_text}]}]
 
     system_content = [{"text": request.system}] if request.system else None
 
-    # Initial SSE event
     yield f"event: init\ndata: {json.dumps({'status': 'connected', 'modelId': request.modelId})}\n\n"
 
     queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
 
+    # Worker thread consumes blocking Boto3 socket stream to prevent asyncio loop starvation
     def worker():
         try:
             kwargs = {
@@ -109,61 +111,43 @@ async def stream_bedrock_events(request: ChatRequest) -> AsyncGenerator[str, Non
                 kwargs["system"] = system_content
 
             response = bedrock_runtime.converse_stream(**kwargs)
-            stream = response.get("stream")
-
-            for event in stream:
+            for event in response.get("stream"):
                 loop.call_soon_threadsafe(queue.put_nowait, event)
-
             loop.call_soon_threadsafe(queue.put_nowait, _STREAM_END)
         except Exception as e:
             loop.call_soon_threadsafe(queue.put_nowait, e)
 
-    # Start stream consumer on background thread
-    thread = threading.Thread(target=worker, daemon=True)
-    thread.start()
+    threading.Thread(target=worker, daemon=True).start()
 
-    try:
-        while True:
-            item = await queue.get()
-            if item is _STREAM_END:
-                break
-            if isinstance(item, Exception):
-                error_payload = json.dumps({"error": True, "message": str(item)})
-                yield f"event: error\ndata: {error_payload}\n\n"
-                break
+    while True:
+        item = await queue.get()
+        if item is _STREAM_END:
+            break
+        if isinstance(item, Exception):
+            yield f"event: error\ndata: {json.dumps({'error': True, 'message': str(item)})}\n\n"
+            break
 
-            event = item
-            if "contentBlockDelta" in event:
-                delta = event["contentBlockDelta"]["delta"]
-                if "text" in delta:
-                    payload = json.dumps({"text": delta["text"]})
-                    yield f"event: delta\ndata: {payload}\n\n"
-
-            elif "messageStop" in event:
-                stop_info = event["messageStop"]
-                payload = json.dumps({"stopReason": stop_info.get("stopReason")})
-                yield f"event: done\ndata: {payload}\n\n"
-
-            elif "metadata" in event:
-                usage = event["metadata"].get("usage", {})
-                metrics = event["metadata"].get("metrics", {})
-                payload = json.dumps({"usage": usage, "metrics": metrics})
-                yield f"event: metadata\ndata: {payload}\n\n"
-
-    finally:
-        pass
-
+        event = item
+        if "contentBlockDelta" in event:
+            delta = event["contentBlockDelta"]["delta"]
+            if "text" in delta:
+                yield f"event: delta\ndata: {json.dumps({'text': delta['text']})}\n\n"
+        elif "messageStop" in event:
+            yield f"event: done\ndata: {json.dumps({'stopReason': event['messageStop'].get('stopReason')})}\n\n"
+        elif "metadata" in event:
+            yield f"event: metadata\ndata: {json.dumps(event['metadata'])}\n\n"
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy", "service": "Bedrock Python Streaming API"}
-
+    return {"status": "healthy"}
 
 @app.post("/stream")
 async def chat_stream(request: ChatRequest, _auth: Optional[str] = Depends(verify_api_key)):
-    """
-    Streams Server-Sent Events over HTTP.
-    """
+    if request.modelId not in ALLOWED_MODELS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model '{request.modelId}' not in allowlist. Allowed: {list(ALLOWED_MODELS)}"
+        )
     return StreamingResponse(
         stream_bedrock_events(request),
         media_type="text/event-stream",
@@ -174,7 +158,6 @@ async def chat_stream(request: ChatRequest, _auth: Optional[str] = Depends(verif
         }
     )
 
-
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8080, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8080)
